@@ -1,7 +1,8 @@
 --// =============================================
---// RIVALS MOBILE AIMBOT — SMOOTH AIM
---// Smoothness · Team Check · Visible Check
---// Silent Load · Auto Load · Floating Button
+--// RIVALS MOBILE AIMBOT — KICIAHOOK STYLE
+--// Speed · Speed In Attack · SpeedScale-FOV
+--// Max Lock On · Reaction Time
+--// Team Check · Visible Check · Silent Load
 --// Pure Instance UI · Rivals CameraController
 --// =============================================
 
@@ -10,16 +11,12 @@ if getgenv().RivalsAimbotCleanup then
 end
 
 if not game:IsLoaded() then game.Loaded:Wait() end
-task.wait(0.5)
+task.wait(0.2)
 
 --// =============================================
---// [1] LOAD MODE CONFIG
---//
---// getgenv().RivalsSilentLoad = true
---//   hides window on startup, shows floating button
---//
---// getgenv().RivalsAutoLoad = true
---//   aimbot auto-enables on startup
+--// [1] LOAD MODE
+--// getgenv().RivalsSilentLoad = true → hidden UI
+--// getgenv().RivalsAutoLoad = true → aimbot ON
 --// =============================================
 local SILENT_LOAD = getgenv().RivalsSilentLoad or false
 local AUTO_LOAD   = getgenv().RivalsAutoLoad   or false
@@ -38,9 +35,6 @@ local Camera      = workspace.CurrentCamera
 
 --// =============================================
 --// [3] RIVALS CAMERA CONTROLLER
---// Rivals overrides Camera.CFrame every frame
---// must use CameraController.Rotation (Vector2)
---// and CameraController:SetRotation(Vector2)
 --// =============================================
 local CameraController = nil
 
@@ -85,17 +79,34 @@ end
 --// [4] SETTINGS
 --// =============================================
 local Settings = {
-    Enabled      = AUTO_LOAD,
-    AimHead      = true,
-    ShowFOV      = false,
-    FOVRadius    = 150,
-    Smoothness   = 15,        -- 1-100, divided by 100
-    TeamCheck    = false,
-    VisibleCheck = false,
+    Enabled       = AUTO_LOAD,
+    AimHead       = true,
+    ShowFOV       = false,
+    FOVRadius     = 150,
+    TeamCheck     = false,
+    VisibleCheck  = false,
+
+    -- KICIAHOOK SPEED SETTINGS
+    Speed          = 1.50,   -- 0-5: base aim speed (decimal)
+    SpeedInAttack  = 2.50,   -- 0-5: speed while shooting (decimal)
+    SpeedScaleFOV  = 50,     -- 0-100: closer to crosshair = faster tracking
+    MaxLockOn      = 0,      -- 0-10: max seconds on one target (0=unlimited)
+    ReactionTime   = 0,      -- 0-500ms: delay before tracking new target
 }
 
 --// =============================================
---// [5] FOV CIRCLE
+--// [5] LOCK STATE
+--// tracks target, timing, and cooldowns
+--// =============================================
+local Lock = {
+    targetPlayer  = nil,
+    lockStartTick = 0,
+    switchTick    = 0,
+    cooldownUntil = 0,
+}
+
+--// =============================================
+--// [6] FOV CIRCLE
 --// =============================================
 local fovCircle = nil
 
@@ -112,7 +123,7 @@ pcall(function()
 end)
 
 --// =============================================
---// [6] UTILITY FUNCTIONS
+--// [7] UTILITY FUNCTIONS
 --// =============================================
 
 local function getScreenCenter()
@@ -120,15 +131,21 @@ local function getScreenCenter()
 end
 
 -- wrap angle difference into [-pi, pi]
--- prevents camera spinning 360 degrees
 local function angleDiff(from, to)
     local d = to - from
     return ((d + math.pi) % (math.pi * 2)) - math.pi
 end
 
+-- check if player is currently shooting
+local function isAttacking()
+    local ok, pressed = pcall(function()
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    end)
+    return ok and pressed
+end
+
 --// =============================================
---// [7] TEAM CHECK
---// supports Team object and TeamColor fallback
+--// [8] TEAM CHECK
 --// =============================================
 local function isSameTeam(player)
     if not player or not LocalPlayer then return false end
@@ -153,9 +170,8 @@ local function isSameTeam(player)
 end
 
 --// =============================================
---// [8] VISIBILITY CHECK
---// separate raycast from camera to target
---// independent from aimbot camera logic
+--// [9] VISIBILITY CHECK
+--// separate raycast, independent from aimbot
 --// =============================================
 local function isVisible(targetPart)
     if not targetPart then return false end
@@ -163,8 +179,7 @@ local function isVisible(targetPart)
     local ok, result = pcall(function()
         local origin    = Camera.CFrame.Position
         local direction = (targetPart.Position - origin)
-
-        local params = RaycastParams.new()
+        local params    = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
 
         local filterList = {Camera}
@@ -174,7 +189,6 @@ local function isVisible(targetPart)
         params.FilterDescendantsInstances = filterList
 
         local hit = workspace:Raycast(origin, direction, params)
-
         if hit then
             return hit.Instance:IsDescendantOf(targetPart.Parent)
         end
@@ -185,12 +199,13 @@ local function isVisible(targetPart)
 end
 
 --// =============================================
---// [9] FIND CLOSEST TARGET IN FOV
---// respects TeamCheck and VisibleCheck
+--// [10] FIND TARGET IN FOV
+--// returns part, player, and screen distance
 --// =============================================
 local function getTarget()
     local center   = getScreenCenter()
     local bestPart = nil
+    local bestPlr  = nil
     local bestDist = Settings.FOVRadius
 
     for _, player in ipairs(Players:GetPlayers()) do
@@ -216,19 +231,32 @@ local function getTarget()
         if dist < bestDist then
             bestDist = dist
             bestPart = part
+            bestPlr  = player
         end
     end
 
-    return bestPart
+    return bestPart, bestPlr, bestDist
 end
 
 --// =============================================
---// [10] MAIN RENDER LOOP
---// every frame:
---//   1. update FOV circle
---//   2. find closest target
---//   3. calculate pitch/yaw angles
---//   4. smoothly lerp camera rotation
+--// [11] MAIN RENDER LOOP
+--//
+--// KICIAHOOK SPEED SYSTEM:
+--//
+--// Speed:         base aim tracking speed (0-5)
+--// SpeedInAttack: faster speed while shooting
+--// SpeedScale-FOV: closer to crosshair = faster
+--//   targets near center of FOV get boosted speed
+--//   targets at edge of FOV get base speed
+--// Max Lock On:   drops target after N seconds
+--// Reaction Time: delay before tracking new target
+--//
+--// SPEED FORMULA:
+--//   1. pick base: Speed or SpeedInAttack
+--//   2. normalize: speed / 5 → alpha (0-1)
+--//   3. FOV scale: closer to center = faster
+--//      fovFactor = 1 + (1 - dist/fovRadius) * (speedScaleFOV/100)
+--//   4. final: alpha * fovFactor, clamped 0-1
 --// =============================================
 local renderConnection
 
@@ -244,43 +272,116 @@ renderConnection = RunService.RenderStepped:Connect(function()
         end)
     end
 
-    if not Settings.Enabled then return end
+    -- bail if disabled
+    if not Settings.Enabled then
+        Lock.targetPlayer = nil
+        return
+    end
     if not CameraController then return end
 
-    local targetPart = getTarget()
-    if not targetPart then return end
+    -- COOLDOWN CHECK: after max lock expires
+    if tick() < Lock.cooldownUntil then return end
 
+    -- find target
+    local targetPart, targetPlayer, screenDist = getTarget()
+
+    if not targetPart then
+        Lock.targetPlayer = nil
+        return
+    end
+
+    -- ————————————————————————————————
+    -- TARGET SWITCH DETECTION
+    -- new target → reset lock timing
+    -- ————————————————————————————————
+    if targetPlayer ~= Lock.targetPlayer then
+        Lock.targetPlayer  = targetPlayer
+        Lock.lockStartTick = tick()
+        Lock.switchTick    = tick()
+    end
+
+    -- ————————————————————————————————
+    -- MAX LOCK ON CHECK
+    -- drop target after N seconds (0 = unlimited)
+    -- ————————————————————————————————
+    if Settings.MaxLockOn > 0 then
+        local elapsed = tick() - Lock.lockStartTick
+        if elapsed > Settings.MaxLockOn then
+            Lock.targetPlayer  = nil
+            Lock.cooldownUntil = tick() + math.max(Settings.ReactionTime / 1000, 0.3)
+            return
+        end
+    end
+
+    -- ————————————————————————————————
+    -- REACTION TIME CHECK
+    -- wait before tracking new target (0 = instant)
+    -- ————————————————————————————————
+    if Settings.ReactionTime > 0 then
+        local sinceSwitch = (tick() - Lock.switchTick) * 1000
+        if sinceSwitch < Settings.ReactionTime then
+            return
+        end
+    end
+
+    -- ————————————————————————————————
+    -- CALCULATE AIM ANGLES
+    -- ————————————————————————————————
     pcall(function()
         local camPos  = Camera.CFrame.Position
         local dirUnit = (targetPart.Position - camPos).Unit
 
-        -- calculate target angles
-        -- pitch = vertical: math.asin(Y)
-        -- yaw = horizontal: math.atan2(-X, -Z)
         local targetPitch = math.asin(dirUnit.Y)
         local targetYaw   = math.atan2(-dirUnit.X, -dirUnit.Z)
 
-        -- get current rotation from CameraController
-        local current = CameraController.Rotation
+        -- ————————————————————————————————
+        -- KICIAHOOK SPEED CALCULATION
+        -- ————————————————————————————————
 
-        -- smoothness: slider 1-100 → divide by 100 → lerp alpha
-        -- low value = slow smooth tracking
-        -- high value = fast snappy lock
-        local alpha = Settings.Smoothness / 100
+        -- step 1: pick base speed or attack speed
+        local currentSpeed = Settings.Speed
+        if isAttacking() then
+            currentSpeed = Settings.SpeedInAttack
+        end
 
-        -- lerp pitch directly (no wrapping needed)
+        -- step 2: normalize to lerp alpha (0-5 → 0-1)
+        local alpha = currentSpeed / 5
+
+        -- step 3: SPEEDSCALE-FOV
+        -- targets closer to crosshair center get faster tracking
+        -- targets at edge of FOV get base speed
+        --
+        -- formula:
+        --   closeness = 1 - (screenDist / fovRadius)
+        --   closeness goes from 0 (at FOV edge) to 1 (at center)
+        --   fovFactor = 1 + closeness * (speedScaleFOV / 100)
+        --
+        -- example at SpeedScaleFOV=50:
+        --   target at center:   fovFactor = 1 + 1.0 * 0.5 = 1.5x speed
+        --   target at mid FOV:  fovFactor = 1 + 0.5 * 0.5 = 1.25x speed
+        --   target at edge:     fovFactor = 1 + 0.0 * 0.5 = 1.0x speed
+        if Settings.SpeedScaleFOV > 0 and Settings.FOVRadius > 0 then
+            local closeness = 1 - math.clamp(screenDist / Settings.FOVRadius, 0, 1)
+            local fovFactor = 1 + closeness * (Settings.SpeedScaleFOV / 100)
+            alpha = alpha * fovFactor
+        end
+
+        -- step 4: clamp final alpha
+        alpha = math.clamp(alpha, 0, 1)
+
+        -- ————————————————————————————————
+        -- APPLY ROTATION
+        -- ————————————————————————————————
+        local current  = CameraController.Rotation
         local newPitch = current.X + (targetPitch - current.X) * alpha
+        local newYaw   = current.Y + angleDiff(current.Y, targetYaw) * alpha
 
-        -- lerp yaw with angle wrapping
-        local newYaw = current.Y + angleDiff(current.Y, targetYaw) * alpha
-
-        -- apply rotation
         CameraController:SetRotation(Vector2.new(newPitch, newYaw))
     end)
 end)
 
 --// =============================================
---// [11] UI COLOR PALETTE
+--// [12] UI COLORS
 --// =============================================
 local C = {
     bg          = Color3.fromRGB(14, 14, 24),
@@ -302,7 +403,7 @@ local C = {
 }
 
 --// =============================================
---// [12] SCREENGUI
+--// [13] SCREENGUI
 --// =============================================
 pcall(function()
     local old = CoreGui:FindFirstChild("RivalsAimbotGui")
@@ -323,12 +424,12 @@ end)
 screenGui.Parent = CoreGui
 
 --// =============================================
---// [13] MAIN WINDOW
+--// [14] MAIN WINDOW
 --// =============================================
 local mainFrame = Instance.new("Frame")
 mainFrame.Name             = "MainWindow"
-mainFrame.Size             = UDim2.new(0, 270, 0, 400)
-mainFrame.Position         = UDim2.new(0.5, -135, 0.08, 0)
+mainFrame.Size             = UDim2.new(0, 270, 0, 480)
+mainFrame.Position         = UDim2.new(0.5, -135, 0.06, 0)
 mainFrame.BackgroundColor3 = C.bg
 mainFrame.BorderSizePixel  = 0
 mainFrame.Visible          = not SILENT_LOAD
@@ -341,9 +442,7 @@ mainStroke.Color = C.accentDim; mainStroke.Thickness = 1.5
 mainStroke.Transparency = 0.3; mainStroke.Parent = mainFrame
 
 --// =============================================
---// [14] FLOATING TOGGLE BUTTON
---// always visible, tap to show/hide window
---// draggable to reposition anywhere on screen
+--// [15] FLOATING TOGGLE BUTTON
 --// =============================================
 local floatBtn = Instance.new("TextButton")
 floatBtn.Name             = "FloatToggle"
@@ -368,7 +467,6 @@ local fGlow = Instance.new("UIStroke")
 fGlow.Color = C.accentGlow; fGlow.Thickness = 4
 fGlow.Transparency = 0.7; fGlow.Parent = floatBtn
 
--- tap to toggle window
 floatBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = not mainFrame.Visible
     floatBtn.Text = mainFrame.Visible and "✕" or "⚡"
@@ -381,7 +479,7 @@ floatBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
--- float button draggable
+-- float button drag
 local floatDragging  = false
 local floatDragStart = Vector2.zero
 local floatStartPos  = UDim2.new()
@@ -396,7 +494,7 @@ floatBtn.InputBegan:Connect(function(input)
 end)
 
 --// =============================================
---// [15] TITLE BAR
+--// [16] TITLE BAR
 --// =============================================
 local titleBar = Instance.new("Frame")
 titleBar.Name = "TitleBar"; titleBar.Size = UDim2.new(1, 0, 0, 44)
@@ -422,7 +520,6 @@ titleLabel.TextColor3 = C.text; titleLabel.TextSize = 15
 titleLabel.Font = Enum.Font.GothamBold; titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.ZIndex = 6; titleLabel.Parent = titleBar
 
--- minimize button (hides window)
 local closeBtn = Instance.new("TextButton")
 closeBtn.Size = UDim2.new(0, 28, 0, 28); closeBtn.Position = UDim2.new(1, -36, 0, 8)
 closeBtn.BackgroundColor3 = C.danger; closeBtn.Text = "—"
@@ -438,7 +535,7 @@ closeBtn.MouseButton1Click:Connect(function()
 end)
 
 --// =============================================
---// [16] SCROLLING CONTENT AREA
+--// [17] SCROLL CONTENT
 --// =============================================
 local content = Instance.new("ScrollingFrame")
 content.Name = "Content"; content.Size = UDim2.new(1, 0, 1, -50)
@@ -451,13 +548,12 @@ content.ScrollingDirection = Enum.ScrollingDirection.Y; content.Parent = mainFra
 local cl = Instance.new("UIListLayout"); cl.SortOrder = Enum.SortOrder.LayoutOrder
 cl.Padding = UDim.new(0, 4); cl.Parent = content
 
-local cp = Instance.new("UIPadding"); cp.PaddingTop = UDim.new(0, 6)
-cp.PaddingBottom = UDim.new(0, 14); cp.PaddingLeft = UDim.new(0, 10)
-cp.PaddingRight = UDim.new(0, 10); cp.Parent = content
+local cpad = Instance.new("UIPadding"); cpad.PaddingTop = UDim.new(0, 6)
+cpad.PaddingBottom = UDim.new(0, 14); cpad.PaddingLeft = UDim.new(0, 10)
+cpad.PaddingRight = UDim.new(0, 10); cpad.Parent = content
 
 --// =============================================
---// [17] GLOBAL INPUT HANDLER
---// window drag + float button drag + slider drag
+--// [18] GLOBAL INPUT HANDLER
 --// =============================================
 local windowDragging  = false
 local windowDragStart = Vector2.zero
@@ -503,7 +599,7 @@ UserInputService.InputChanged:Connect(function(input)
 
         s.fill.Size      = UDim2.new(pct, 0, 1, 0)
         s.thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        s.label.Text     = s.name .. ": " .. tostring(val)
+        s.label.Text     = s.name .. ": " .. string.format(s.fmt, val)
         s.value = val
         if s.callback then s.callback(val) end
     end
@@ -519,7 +615,7 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 --// =============================================
---// [18] UI COMPONENT BUILDERS
+--// [19] UI COMPONENT BUILDERS
 --// =============================================
 local layoutOrder = 0
 local function nextOrder() layoutOrder = layoutOrder + 1; return layoutOrder end
@@ -572,26 +668,26 @@ local function createToggle(name, default, callback)
     pill.BorderSizePixel = 0; pill.Parent = row
     Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
 
-    local knob = Instance.new("Frame"); knob.Size = UDim2.new(0, 20, 0, 20)
-    knob.Position = default and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
-    knob.BackgroundColor3 = C.knob; knob.BorderSizePixel = 0; knob.Parent = pill
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+    local knobF = Instance.new("Frame"); knobF.Size = UDim2.new(0, 20, 0, 20)
+    knobF.Position = default and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+    knobF.BackgroundColor3 = C.knob; knobF.BorderSizePixel = 0; knobF.Parent = pill
+    Instance.new("UICorner", knobF).CornerRadius = UDim.new(1, 0)
 
     local ks = Instance.new("UIStroke"); ks.Color = Color3.new(0,0,0)
-    ks.Thickness = 1; ks.Transparency = 0.85; ks.Parent = knob
+    ks.Thickness = 1; ks.Transparency = 0.85; ks.Parent = knobF
 
     local state = default
-    local info = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tweenI = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
     local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 1, 0)
     btn.BackgroundTransparency = 1; btn.Text = ""; btn.ZIndex = 2; btn.Parent = row
 
     btn.MouseButton1Click:Connect(function()
         state = not state
-        TweenService:Create(knob, info, {
+        TweenService:Create(knobF, tweenI, {
             Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
         }):Play()
-        TweenService:Create(pill, info, {
+        TweenService:Create(pill, tweenI, {
             BackgroundColor3 = state and C.accent or C.toggleOff
         }):Play()
         if callback then callback(state) end
@@ -600,10 +696,15 @@ end
 
 local function createSlider(name, min, max, default, step, callback)
     step = step or 1
+    local decimals = 0
+    local ss = tostring(step); local dot = ss:find("%.")
+    if dot then decimals = #ss - dot end
+    local fmt = "%." .. decimals .. "f"
 
     local function snap(raw)
         local v = math.floor(raw / step + 0.5) * step
-        return math.clamp(v, min, max)
+        v = math.clamp(v, min, max)
+        return tonumber(string.format(fmt, v))
     end
 
     local initPct = math.clamp((default - min) / (max - min), 0, 1)
@@ -615,7 +716,7 @@ local function createSlider(name, min, max, default, step, callback)
 
     local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -24, 0, 20)
     lbl.Position = UDim2.new(0, 12, 0, 4); lbl.BackgroundTransparency = 1
-    lbl.Text = name..": "..tostring(default); lbl.TextColor3 = C.textDim
+    lbl.Text = name..": "..string.format(fmt, default); lbl.TextColor3 = C.textDim
     lbl.TextSize = 12; lbl.Font = Enum.Font.GothamMedium
     lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
 
@@ -637,7 +738,7 @@ local function createSlider(name, min, max, default, step, callback)
 
     local data = {
         track = track, fill = fill, thumb = thumb, label = lbl,
-        name = name, min = min, max = max, snap = snap,
+        name = name, min = min, max = max, snap = snap, fmt = fmt,
         value = default, callback = callback,
     }
 
@@ -652,7 +753,7 @@ local function createSlider(name, min, max, default, step, callback)
         local val = snap(min + pct * (max - min))
         pct = math.clamp((val - min) / (max - min), 0, 1)
         fill.Size = UDim2.new(pct, 0, 1, 0); thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        lbl.Text = name..": "..tostring(val); data.value = val
+        lbl.Text = name..": "..string.format(fmt, val); data.value = val
         if callback then callback(val) end
     end
 
@@ -667,28 +768,24 @@ local function createSlider(name, min, max, default, step, callback)
 end
 
 --// =============================================
---// [19] BUILD ALL UI ELEMENTS
+--// [20] BUILD ALL UI ELEMENTS
 --// =============================================
 
--- status line
 if CameraController then
     createStatus("✓ CameraController connected", C.success)
 else
     createStatus("✗ CameraController not found", Color3.fromRGB(255, 180, 50))
 end
 
-if SILENT_LOAD then
-    createStatus("🔇 Silent Load active", C.textDim)
-end
-if AUTO_LOAD then
-    createStatus("⚡ Auto Load — aimbot enabled", C.accentGlow)
-end
+if SILENT_LOAD then createStatus("🔇 Silent Load active", C.textDim) end
+if AUTO_LOAD then createStatus("⚡ Auto Load — aimbot ON", C.accentGlow) end
 
 createDivider()
-createSection("AIMBOT")
+createSection("TARGETING")
 
 createToggle("Aimbot", AUTO_LOAD, function(v)
     Settings.Enabled = v
+    if not v then Lock.targetPlayer = nil end
 end)
 
 createToggle("Aim At Head", true, function(v)
@@ -703,10 +800,6 @@ createSlider("FOV Radius", 10, 500, 150, 1, function(v)
     Settings.FOVRadius = v
 end)
 
-createSlider("Smoothness", 1, 100, 15, 1, function(v)
-    Settings.Smoothness = v
-end)
-
 createDivider()
 createSection("CHECKS")
 
@@ -718,8 +811,34 @@ createToggle("Visible Check", false, function(v)
     Settings.VisibleCheck = v
 end)
 
+createDivider()
+createSection("AIM SPEED")
+
+createSlider("Speed", 0, 5, 1.50, 0.05, function(v)
+    Settings.Speed = v
+end)
+
+createSlider("Speed In Attack", 0, 5, 2.50, 0.05, function(v)
+    Settings.SpeedInAttack = v
+end)
+
+createSlider("SpeedScale-FOV", 0, 100, 50, 1, function(v)
+    Settings.SpeedScaleFOV = v
+end)
+
+createDivider()
+createSection("LOCK CONTROL")
+
+createSlider("Max Lock On", 0, 10, 0, 1, function(v)
+    Settings.MaxLockOn = v
+end)
+
+createSlider("Reaction Time", 0, 500, 0, 1, function(v)
+    Settings.ReactionTime = v
+end)
+
 --// =============================================
---// [20] CLEANUP
+--// [21] CLEANUP
 --// =============================================
 local function fullCleanup()
     pcall(function() renderConnection:Disconnect() end)
