@@ -1,0 +1,896 @@
+--// =============================================
+--// RIVALS MOBILE AIMBOT — KICIAHOOK STYLE
+--// Speed · Speed In Attack · Speed Scale
+--// Max Lock On · Reaction Time
+--// Pure Instance UI · Rivals CameraController
+--// =============================================
+
+if getgenv().RivalsAimbotCleanup then
+    pcall(getgenv().RivalsAimbotCleanup)
+end
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+task.wait(0.5)
+
+--// =============================================
+--// [1] SERVICES
+--// =============================================
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local CoreGui          = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+
+--// =============================================
+--// [2] GET RIVALS CAMERA CONTROLLER
+--// Rivals overrides Camera.CFrame every frame
+--// so we must use their CameraController module
+--// which exposes .Rotation and :SetRotation()
+--// =============================================
+local CameraController = nil
+
+-- attempt 1: direct require
+pcall(function()
+    CameraController = require(
+        LocalPlayer
+            :WaitForChild("PlayerScripts", 10)
+            :WaitForChild("Controllers", 10)
+            :WaitForChild("TimerController", 10)
+            :WaitForChild("CameraController", 10)
+    )
+end)
+
+-- attempt 2: through parent module
+if not CameraController then
+    pcall(function()
+        local timer = require(
+            LocalPlayer.PlayerScripts
+                :WaitForChild("Controllers", 10)
+                :WaitForChild("TimerController", 10)
+        )
+        if timer and timer.CameraController then
+            CameraController = timer.CameraController
+        end
+    end)
+end
+
+-- attempt 3: search all descendants
+if not CameraController then
+    pcall(function()
+        for _, desc in ipairs(LocalPlayer.PlayerScripts:GetDescendants()) do
+            if desc:IsA("ModuleScript") and desc.Name == "CameraController" then
+                local ok, mod = pcall(require, desc)
+                if ok and mod and mod.Rotation and mod.SetRotation then
+                    CameraController = mod
+                    break
+                end
+            end
+        end
+    end)
+end
+
+--// =============================================
+--// [3] SETTINGS
+--// =============================================
+local Settings = {
+    Enabled       = false,
+    AimHead       = true,      -- true=Head, false=HumanoidRootPart
+    ShowFOV       = false,
+    FOVRadius     = 150,
+
+    -- KICIAHOOK STYLE SPEED SETTINGS
+    Speed         = 2.0,       -- 0-5: base aim speed
+    SpeedInAttack = 3.5,       -- 0-5: aim speed while shooting
+    SpeedScale    = 50,        -- 0-100: velocity-based speed scaling
+    MaxLockOn     = 0,         -- 0-10: max seconds locked on one target (0=unlimited)
+    ReactionTime  = 0,         -- 0-500: ms delay before tracking new target
+}
+
+--// =============================================
+--// [4] LOCK-ON STATE
+--// tracks current target, lock timing,
+--// reaction delay, and cooldown
+--// =============================================
+local LockState = {
+    targetPlayer  = nil,       -- currently locked player
+    lockStartTick = 0,         -- tick() when lock was acquired
+    switchTick    = 0,         -- tick() when target last changed
+    cooldownUntil = 0,         -- tick() before which no locking allowed
+}
+
+--// =============================================
+--// [5] FOV CIRCLE (Drawing Library)
+--// =============================================
+local fovCircle = nil
+
+pcall(function()
+    fovCircle = Drawing.new("Circle")
+    fovCircle.Thickness    = 1.5
+    fovCircle.NumSides     = 64
+    fovCircle.Radius       = Settings.FOVRadius
+    fovCircle.Filled       = false
+    fovCircle.Visible      = false
+    fovCircle.ZIndex       = 999
+    fovCircle.Transparency = 0.8
+    fovCircle.Color        = Color3.fromRGB(255, 255, 255)
+end)
+
+--// =============================================
+--// [6] UTILITY FUNCTIONS
+--// =============================================
+
+local function getScreenCenter()
+    return Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+end
+
+-- wraps angle difference into [-pi, pi]
+-- prevents 360 degree spin when crossing boundary
+local function angleDiff(from, to)
+    local d = to - from
+    return ((d + math.pi) % (math.pi * 2)) - math.pi
+end
+
+-- check if player is currently shooting
+-- on mobile, Rivals shoot button triggers MouseButton1
+local function isAttacking()
+    local ok, pressed = pcall(function()
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    end)
+    return ok and pressed
+end
+
+-- find closest enemy part to screen center within FOV
+local function getTarget()
+    local center  = getScreenCenter()
+    local bestPart = nil
+    local bestDist = Settings.FOVRadius
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+
+        local char = player.Character
+        if not char then continue end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+
+        local partName = Settings.AimHead and "Head" or "HumanoidRootPart"
+        local part = char:FindFirstChild(partName)
+        if not part then continue end
+
+        local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
+        if not onScreen then continue end
+
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+        if dist < bestDist then
+            bestDist = dist
+            bestPart = part
+        end
+    end
+
+    return bestPart
+end
+
+--// =============================================
+--// [7] AIMBOT RENDER LOOP
+--// every frame:
+--//   1. update FOV circle
+--//   2. find target in FOV
+--//   3. handle lock-on state (max lock, reaction)
+--//   4. calculate speed (base, attack, velocity)
+--//   5. lerp CameraController rotation
+--// =============================================
+local renderConnection
+
+renderConnection = RunService.RenderStepped:Connect(function()
+    Camera = workspace.CurrentCamera
+
+    -- update FOV circle every frame
+    if fovCircle then
+        pcall(function()
+            fovCircle.Position = getScreenCenter()
+            fovCircle.Radius   = Settings.FOVRadius
+            fovCircle.Visible  = Settings.ShowFOV
+        end)
+    end
+
+    -- bail if disabled or no camera controller
+    if not Settings.Enabled then
+        LockState.targetPlayer = nil
+        return
+    end
+    if not CameraController then return end
+
+    -- COOLDOWN CHECK: after max lock expires, brief pause
+    if tick() < LockState.cooldownUntil then return end
+
+    -- find closest target in FOV
+    local targetPart = getTarget()
+    if not targetPart then
+        LockState.targetPlayer = nil
+        return
+    end
+
+    -- identify which player this target belongs to
+    local targetPlayer = nil
+    pcall(function()
+        targetPlayer = Players:GetPlayerFromCharacter(targetPart.Parent)
+    end)
+
+    -- ————————————————————————————————
+    -- TARGET SWITCH DETECTION
+    -- if target player changed, reset lock timing
+    -- this triggers reaction time for new targets
+    -- ————————————————————————————————
+    if targetPlayer ~= LockState.targetPlayer then
+        LockState.targetPlayer  = targetPlayer
+        LockState.lockStartTick = tick()
+        LockState.switchTick    = tick()
+    end
+
+    -- ————————————————————————————————
+    -- MAX LOCK ON CHECK
+    -- drop target after N seconds of continuous lock
+    -- adds cooldown before re-locking to prevent flicker
+    -- 0 = unlimited (never drops)
+    -- ————————————————————————————————
+    if Settings.MaxLockOn > 0 then
+        local lockElapsed = tick() - LockState.lockStartTick
+        if lockElapsed > Settings.MaxLockOn then
+            LockState.targetPlayer  = nil
+            -- cooldown: at least reaction time, minimum 0.3s
+            LockState.cooldownUntil = tick() + math.max(Settings.ReactionTime / 1000, 0.3)
+            return
+        end
+    end
+
+    -- ————————————————————————————————
+    -- REACTION TIME CHECK
+    -- don't aim until reaction delay has passed
+    -- simulates human reaction to new target appearing
+    -- 0 = instant (no delay)
+    -- ————————————————————————————————
+    if Settings.ReactionTime > 0 then
+        local sinceSwitch = (tick() - LockState.switchTick) * 1000
+        if sinceSwitch < Settings.ReactionTime then
+            return
+        end
+    end
+
+    -- ————————————————————————————————
+    -- CALCULATE AIM ANGLES
+    -- pitch = vertical (asin of Y)
+    -- yaw   = horizontal (atan2 of -X, -Z)
+    -- ————————————————————————————————
+    pcall(function()
+        local camPos    = Camera.CFrame.Position
+        local targetPos = targetPart.Position
+        local dirUnit   = (targetPos - camPos).Unit
+
+        local targetPitch = math.asin(dirUnit.Y)
+        local targetYaw   = math.atan2(-dirUnit.X, -dirUnit.Z)
+
+        -- ————————————————————————————————
+        -- CALCULATE SPEED (lerp alpha)
+        --
+        -- SPEED:          base tracking speed (0-5)
+        -- SPEED IN ATTACK: faster speed while shooting (0-5)
+        -- SPEED SCALE:     multiplier based on target velocity (0-100)
+        --                  faster moving targets = more aggressive tracking
+        --
+        -- formula:
+        --   baseAlpha = speed / 5  (normalizes 0-5 to 0-1)
+        --   if attacking: use SpeedInAttack instead
+        --   velFactor = 1 + (targetVelocity / 16) * (speedScale / 100)
+        --   finalAlpha = clamp(baseAlpha * velFactor, 0, 1)
+        -- ————————————————————————————————
+        local currentSpeed = Settings.Speed
+        if isAttacking() then
+            currentSpeed = Settings.SpeedInAttack
+        end
+
+        local alpha = currentSpeed / 5
+
+        -- SPEED SCALE: velocity-based multiplier
+        if Settings.SpeedScale > 0 then
+            local targetRoot = targetPart.Parent:FindFirstChild("HumanoidRootPart")
+            if targetRoot then
+                local vel = targetRoot.AssemblyLinearVelocity.Magnitude
+                -- 16 = default walkspeed, used as baseline
+                -- at speedScale=100 and vel=16: doubles the alpha
+                -- at speedScale=50 and vel=16: alpha * 1.5
+                local velFactor = 1 + (vel / 16) * (Settings.SpeedScale / 100)
+                alpha = alpha * velFactor
+            end
+        end
+
+        alpha = math.clamp(alpha, 0, 1)
+
+        -- ————————————————————————————————
+        -- APPLY ROTATION
+        -- lerp current toward target angles
+        -- angleDiff handles ±pi wrapping on yaw
+        -- ————————————————————————————————
+        local current  = CameraController.Rotation
+        local newPitch = current.X + (targetPitch - current.X) * alpha
+        local newYaw   = current.Y + angleDiff(current.Y, targetYaw) * alpha
+
+        CameraController:SetRotation(Vector2.new(newPitch, newYaw))
+    end)
+end)
+
+--// =============================================
+--// [8] UI COLOR PALETTE
+--// =============================================
+local C = {
+    bg           = Color3.fromRGB(14, 14, 24),
+    surface      = Color3.fromRGB(22, 22, 38),
+    surfaceHover = Color3.fromRGB(32, 32, 52),
+    accent       = Color3.fromRGB(130, 50, 235),
+    accentGlow   = Color3.fromRGB(155, 85, 255),
+    accentDim    = Color3.fromRGB(80, 30, 150),
+    text         = Color3.fromRGB(225, 225, 240),
+    textDim      = Color3.fromRGB(120, 120, 150),
+    toggleOff    = Color3.fromRGB(45, 45, 65),
+    knob         = Color3.fromRGB(240, 240, 250),
+    sliderTrack  = Color3.fromRGB(38, 38, 58),
+    danger       = Color3.fromRGB(210, 50, 50),
+    success      = Color3.fromRGB(60, 210, 90),
+    sectionText  = Color3.fromRGB(155, 85, 255),
+}
+
+--// =============================================
+--// [9] CREATE SCREENGUI
+--// =============================================
+pcall(function()
+    local old = CoreGui:FindFirstChild("RivalsAimbotGui")
+    if old then old:Destroy() end
+end)
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name           = "RivalsAimbotGui"
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.ResetOnSpawn   = false
+screenGui.DisplayOrder   = 100
+
+pcall(function()
+    if syn and syn.protect_gui then syn.protect_gui(screenGui)
+    elseif protectgui then protectgui(screenGui) end
+end)
+
+screenGui.Parent = CoreGui
+
+--// =============================================
+--// [10] MAIN WINDOW FRAME (fixed size)
+--// =============================================
+local mainFrame = Instance.new("Frame")
+mainFrame.Name             = "MainWindow"
+mainFrame.Size             = UDim2.new(0, 270, 0, 440)
+mainFrame.Position         = UDim2.new(0.5, -135, 0.08, 0)
+mainFrame.BackgroundColor3 = C.bg
+mainFrame.BorderSizePixel  = 0
+mainFrame.Parent           = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 14)
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color        = C.accentDim
+mainStroke.Thickness    = 1.5
+mainStroke.Transparency = 0.3
+mainStroke.Parent       = mainFrame
+
+--// =============================================
+--// [11] TITLE BAR
+--// =============================================
+local titleBar = Instance.new("Frame")
+titleBar.Name             = "TitleBar"
+titleBar.Size             = UDim2.new(1, 0, 0, 44)
+titleBar.Position         = UDim2.new(0, 0, 0, 0)
+titleBar.BackgroundColor3 = C.surface
+titleBar.BorderSizePixel  = 0
+titleBar.ZIndex           = 5
+titleBar.Parent           = mainFrame
+
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 14)
+
+-- square off bottom corners
+local titleFix = Instance.new("Frame")
+titleFix.Size             = UDim2.new(1, 0, 0, 14)
+titleFix.Position         = UDim2.new(0, 0, 1, -14)
+titleFix.BackgroundColor3 = C.surface
+titleFix.BorderSizePixel  = 0
+titleFix.ZIndex           = 5
+titleFix.Parent           = titleBar
+
+-- accent line
+local accentLine = Instance.new("Frame")
+accentLine.Size             = UDim2.new(1, -24, 0, 2)
+accentLine.Position         = UDim2.new(0, 12, 1, 0)
+accentLine.BackgroundColor3 = C.accent
+accentLine.BorderSizePixel  = 0
+accentLine.ZIndex           = 6
+accentLine.Parent           = titleBar
+
+-- title text
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size                   = UDim2.new(1, -56, 1, 0)
+titleLabel.Position               = UDim2.new(0, 16, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text                   = "⚡ Rivals Aimbot"
+titleLabel.TextColor3             = C.text
+titleLabel.TextSize               = 15
+titleLabel.Font                   = Enum.Font.GothamBold
+titleLabel.TextXAlignment         = Enum.TextXAlignment.Left
+titleLabel.ZIndex                 = 6
+titleLabel.Parent                 = titleBar
+
+-- close button
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size             = UDim2.new(0, 28, 0, 28)
+closeBtn.Position         = UDim2.new(1, -36, 0, 8)
+closeBtn.BackgroundColor3 = C.danger
+closeBtn.Text             = "✕"
+closeBtn.TextColor3       = Color3.new(1, 1, 1)
+closeBtn.TextSize         = 13
+closeBtn.Font             = Enum.Font.GothamBold
+closeBtn.BorderSizePixel  = 0
+closeBtn.ZIndex           = 7
+closeBtn.Parent           = titleBar
+
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
+
+--// =============================================
+--// [12] SCROLLING CONTENT AREA
+--// =============================================
+local content = Instance.new("ScrollingFrame")
+content.Name                       = "Content"
+content.Size                       = UDim2.new(1, 0, 1, -50)
+content.Position                   = UDim2.new(0, 0, 0, 50)
+content.BackgroundTransparency     = 1
+content.BorderSizePixel            = 0
+content.ScrollBarThickness         = 3
+content.ScrollBarImageColor3       = C.accent
+content.ScrollBarImageTransparency = 0.5
+content.CanvasSize                 = UDim2.new(0, 0, 0, 0)
+content.AutomaticCanvasSize        = Enum.AutomaticSize.Y
+content.ScrollingDirection         = Enum.ScrollingDirection.Y
+content.Parent                     = mainFrame
+
+local contentLayout = Instance.new("UIListLayout")
+contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+contentLayout.Padding   = UDim.new(0, 4)
+contentLayout.Parent    = content
+
+local contentPad = Instance.new("UIPadding")
+contentPad.PaddingTop    = UDim.new(0, 6)
+contentPad.PaddingBottom = UDim.new(0, 12)
+contentPad.PaddingLeft   = UDim.new(0, 10)
+contentPad.PaddingRight  = UDim.new(0, 10)
+contentPad.Parent        = content
+
+--// =============================================
+--// [13] GLOBAL INPUT HANDLER
+--// single handler for window drag + slider drag
+--// prevents connection spam
+--// =============================================
+local windowDragging  = false
+local windowDragStart = Vector2.zero
+local windowStartPos  = UDim2.new()
+local activeSlider    = nil
+
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+    or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        windowDragging  = true
+        windowDragStart = Vector2.new(input.Position.X, input.Position.Y)
+        windowStartPos  = mainFrame.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch
+    and input.UserInputType ~= Enum.UserInputType.MouseMovement then
+        return
+    end
+
+    -- window drag
+    if windowDragging then
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - windowDragStart
+        mainFrame.Position = UDim2.new(
+            windowStartPos.X.Scale,
+            windowStartPos.X.Offset + delta.X,
+            windowStartPos.Y.Scale,
+            windowStartPos.Y.Offset + delta.Y
+        )
+    end
+
+    -- slider drag
+    if activeSlider then
+        local s      = activeSlider
+        local trackX = s.track.AbsolutePosition.X
+        local trackW = s.track.AbsoluteSize.X
+        local pct    = math.clamp((input.Position.X - trackX) / trackW, 0, 1)
+        local rawVal = s.min + pct * (s.max - s.min)
+        local val    = s.snap(rawVal)
+
+        -- recalculate pct from snapped value for visual accuracy
+        pct = math.clamp((val - s.min) / (s.max - s.min), 0, 1)
+
+        s.fill.Size      = UDim2.new(pct, 0, 1, 0)
+        s.thumb.Position = UDim2.new(pct, -9, 0.5, -9)
+        s.label.Text     = s.name .. ": " .. string.format(s.fmt, val)
+        s.value          = val
+
+        if s.callback then s.callback(val) end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+    or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        windowDragging = false
+        activeSlider   = nil
+    end
+end)
+
+--// =============================================
+--// [14] UI COMPONENT — SECTION HEADER
+--// =============================================
+local layoutOrder = 0
+
+local function nextOrder()
+    layoutOrder = layoutOrder + 1
+    return layoutOrder
+end
+
+local function createSection(text)
+    local container = Instance.new("Frame")
+    container.Size                   = UDim2.new(1, 0, 0, 26)
+    container.BackgroundTransparency = 1
+    container.LayoutOrder            = nextOrder()
+    container.Parent                 = content
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, 0, 1, 0)
+    lbl.Position               = UDim2.new(0, 4, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                   = text
+    lbl.TextColor3             = C.sectionText
+    lbl.TextSize               = 11
+    lbl.Font                   = Enum.Font.GothamBold
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.Parent                 = container
+end
+
+--// =============================================
+--// [15] UI COMPONENT — DIVIDER
+--// =============================================
+local function createDivider()
+    local container = Instance.new("Frame")
+    container.Size                   = UDim2.new(1, 0, 0, 10)
+    container.BackgroundTransparency = 1
+    container.LayoutOrder            = nextOrder()
+    container.Parent                 = content
+
+    local line = Instance.new("Frame")
+    line.Size             = UDim2.new(1, 0, 0, 1)
+    line.Position         = UDim2.new(0, 0, 0.5, 0)
+    line.BackgroundColor3 = C.surfaceHover
+    line.BorderSizePixel  = 0
+    line.Parent           = container
+end
+
+--// =============================================
+--// [16] UI COMPONENT — STATUS LABEL
+--// =============================================
+local function createStatus(text, color)
+    local container = Instance.new("Frame")
+    container.Size                   = UDim2.new(1, 0, 0, 24)
+    container.BackgroundTransparency = 1
+    container.LayoutOrder            = nextOrder()
+    container.Parent                 = content
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, 0, 1, 0)
+    lbl.Position               = UDim2.new(0, 4, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                   = text
+    lbl.TextColor3             = color
+    lbl.TextSize               = 12
+    lbl.Font                   = Enum.Font.GothamMedium
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.Parent                 = container
+
+    return lbl
+end
+
+--// =============================================
+--// [17] UI COMPONENT — ANIMATED TOGGLE
+--// tween knob slide + background color
+--// entire row tappable for mobile
+--// =============================================
+local function createToggle(name, default, callback)
+    local row = Instance.new("Frame")
+    row.Name                   = "Toggle_" .. name
+    row.Size                   = UDim2.new(1, 0, 0, 40)
+    row.BackgroundColor3       = C.surface
+    row.BorderSizePixel        = 0
+    row.LayoutOrder            = nextOrder()
+    row.Parent                 = content
+
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, -70, 1, 0)
+    lbl.Position               = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                   = name
+    lbl.TextColor3             = C.text
+    lbl.TextSize               = 13
+    lbl.Font                   = Enum.Font.GothamMedium
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.Parent                 = row
+
+    -- pill background
+    local pill = Instance.new("Frame")
+    pill.Size             = UDim2.new(0, 44, 0, 24)
+    pill.Position         = UDim2.new(1, -56, 0.5, -12)
+    pill.BackgroundColor3 = default and C.accent or C.toggleOff
+    pill.BorderSizePixel  = 0
+    pill.Parent           = row
+
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
+    -- knob
+    local knob = Instance.new("Frame")
+    knob.Size             = UDim2.new(0, 20, 0, 20)
+    knob.Position         = default and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+    knob.BackgroundColor3 = C.knob
+    knob.BorderSizePixel  = 0
+    knob.Parent           = pill
+
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local knobStroke = Instance.new("UIStroke")
+    knobStroke.Color        = Color3.fromRGB(0, 0, 0)
+    knobStroke.Thickness    = 1
+    knobStroke.Transparency = 0.85
+    knobStroke.Parent       = knob
+
+    local state = default
+    local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+    -- invisible tap button
+    local btn = Instance.new("TextButton")
+    btn.Size                   = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text                   = ""
+    btn.ZIndex                 = 2
+    btn.Parent                 = row
+
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(knob, tweenInfo, {
+            Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+        }):Play()
+        TweenService:Create(pill, tweenInfo, {
+            BackgroundColor3 = state and C.accent or C.toggleOff
+        }):Play()
+        if callback then callback(state) end
+    end)
+end
+
+--// =============================================
+--// [18] UI COMPONENT — SLIDER (supports decimals)
+--// `step` controls increment precision
+--// touch-drag compatible for mobile
+--// =============================================
+local function createSlider(name, min, max, default, step, callback)
+    step = step or 1
+
+    -- figure out decimal places from step
+    local decimals = 0
+    local stepStr  = tostring(step)
+    local dot      = stepStr:find("%.")
+    if dot then decimals = #stepStr - dot end
+    local fmt = "%." .. decimals .. "f"
+
+    -- snap a raw value to the nearest step
+    local function snap(raw)
+        local v = math.floor(raw / step + 0.5) * step
+        v = math.clamp(v, min, max)
+        return tonumber(string.format(fmt, v))
+    end
+
+    local initPct = math.clamp((default - min) / (max - min), 0, 1)
+
+    -- container
+    local row = Instance.new("Frame")
+    row.Name                   = "Slider_" .. name
+    row.Size                   = UDim2.new(1, 0, 0, 52)
+    row.BackgroundColor3       = C.surface
+    row.BorderSizePixel        = 0
+    row.LayoutOrder            = nextOrder()
+    row.Parent                 = content
+
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+    -- label: "Name: Value"
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                   = UDim2.new(1, -24, 0, 20)
+    lbl.Position               = UDim2.new(0, 12, 0, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                   = name .. ": " .. string.format(fmt, default)
+    lbl.TextColor3             = C.textDim
+    lbl.TextSize               = 12
+    lbl.Font                   = Enum.Font.GothamMedium
+    lbl.TextXAlignment         = Enum.TextXAlignment.Left
+    lbl.Parent                 = row
+
+    -- track
+    local track = Instance.new("Frame")
+    track.Name             = "Track"
+    track.Size             = UDim2.new(1, -24, 0, 6)
+    track.Position         = UDim2.new(0, 12, 0, 32)
+    track.BackgroundColor3 = C.sliderTrack
+    track.BorderSizePixel  = 0
+    track.Parent           = row
+
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    -- fill
+    local fill = Instance.new("Frame")
+    fill.Size             = UDim2.new(initPct, 0, 1, 0)
+    fill.BackgroundColor3 = C.accent
+    fill.BorderSizePixel  = 0
+    fill.Parent           = track
+
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    -- thumb
+    local thumb = Instance.new("Frame")
+    thumb.Size             = UDim2.new(0, 18, 0, 18)
+    thumb.Position         = UDim2.new(initPct, -9, 0.5, -9)
+    thumb.BackgroundColor3 = C.knob
+    thumb.BorderSizePixel  = 0
+    thumb.ZIndex           = 3
+    thumb.Parent           = track
+
+    Instance.new("UICorner", thumb).CornerRadius = UDim.new(1, 0)
+
+    local thumbStroke = Instance.new("UIStroke")
+    thumbStroke.Color     = C.accent
+    thumbStroke.Thickness = 2
+    thumbStroke.Parent    = thumb
+
+    -- slider data (used by global InputChanged)
+    local data = {
+        track    = track,
+        fill     = fill,
+        thumb    = thumb,
+        label    = lbl,
+        name     = name,
+        min      = min,
+        max      = max,
+        snap     = snap,
+        fmt      = fmt,
+        value    = default,
+        callback = callback,
+    }
+
+    -- start drag on tap (enlarged invisible touch area)
+    local touchArea = Instance.new("TextButton")
+    touchArea.Size                   = UDim2.new(1, 12, 0, 34)
+    touchArea.Position               = UDim2.new(0, -6, 0.5, -17)
+    touchArea.BackgroundTransparency = 1
+    touchArea.Text                   = ""
+    touchArea.ZIndex                 = 4
+    touchArea.Parent                 = track
+
+    local function beginSlide(input)
+        activeSlider = data
+        -- update immediately to touch position
+        local trackX = track.AbsolutePosition.X
+        local trackW = track.AbsoluteSize.X
+        local pct    = math.clamp((input.Position.X - trackX) / trackW, 0, 1)
+        local val    = snap(min + pct * (max - min))
+
+        pct = math.clamp((val - min) / (max - min), 0, 1)
+        fill.Size      = UDim2.new(pct, 0, 1, 0)
+        thumb.Position = UDim2.new(pct, -9, 0.5, -9)
+        lbl.Text       = name .. ": " .. string.format(fmt, val)
+        data.value     = val
+
+        if callback then callback(val) end
+    end
+
+    touchArea.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            beginSlide(input)
+        end
+    end)
+
+    return data
+end
+
+--// =============================================
+--// [19] BUILD ALL UI ELEMENTS
+--// =============================================
+
+-- status
+if CameraController then
+    createStatus("✓ CameraController connected", C.success)
+else
+    createStatus("✗ CameraController not found", Color3.fromRGB(255, 180, 50))
+end
+
+createDivider()
+
+-- ——————— TARGETING ———————
+createSection("TARGETING")
+
+createToggle("Aimbot", false, function(v)
+    Settings.Enabled = v
+    if not v then LockState.targetPlayer = nil end
+end)
+
+createToggle("Aim At Head", true, function(v)
+    Settings.AimHead = v
+end)
+
+createToggle("Show FOV", false, function(v)
+    Settings.ShowFOV = v
+end)
+
+createSlider("FOV Radius", 10, 500, 150, 1, function(v)
+    Settings.FOVRadius = v
+end)
+
+createDivider()
+
+-- ——————— AIM SPEED ———————
+createSection("AIM SPEED")
+
+createSlider("Speed", 0, 5, 2.0, 0.1, function(v)
+    Settings.Speed = v
+end)
+
+createSlider("Speed In Attack", 0, 5, 3.5, 0.1, function(v)
+    Settings.SpeedInAttack = v
+end)
+
+createSlider("Speed Scale", 0, 100, 50, 1, function(v)
+    Settings.SpeedScale = v
+end)
+
+createDivider()
+
+-- ——————— LOCK CONTROL ———————
+createSection("LOCK CONTROL")
+
+createSlider("Max Lock On", 0, 10, 0, 0.1, function(v)
+    Settings.MaxLockOn = v
+end)
+
+createSlider("Reaction Time", 0, 500, 0, 1, function(v)
+    Settings.ReactionTime = v
+end)
+
+--// =============================================
+--// [20] CLOSE BUTTON + FULL CLEANUP
+--// =============================================
+local function fullCleanup()
+    pcall(function() renderConnection:Disconnect() end)
+    pcall(function()
+        if fovCircle then fovCircle.Visible = false; fovCircle:Remove(); fovCircle = nil end
+    end)
+    pcall(function() screenGui:Destroy() end)
+    getgenv().RivalsAimbotCleanup = nil
+end
+
+getgenv().RivalsAimbotCleanup = fullCleanup
+closeBtn.MouseButton1Click:Connect(fullCleanup)
