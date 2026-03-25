@@ -1,6 +1,7 @@
 --// =============================================
---// RIVALS MOBILE AIMBOT — CURVE AIM (BEZIER)
---// Curved path · Overshoot · Wobble · Settle
+--// RIVALS MOBILE AIMBOT — SMOOTH AIM
+--// Smoothness · Team Check · Visible Check
+--// Silent Load · Auto Load · Floating Button
 --// Pure Instance UI · Rivals CameraController
 --// =============================================
 
@@ -12,7 +13,19 @@ if not game:IsLoaded() then game.Loaded:Wait() end
 task.wait(0.5)
 
 --// =============================================
---// [1] SERVICES
+--// [1] LOAD MODE CONFIG
+--//
+--// getgenv().RivalsSilentLoad = true
+--//   hides window on startup, shows floating button
+--//
+--// getgenv().RivalsAutoLoad = true
+--//   aimbot auto-enables on startup
+--// =============================================
+local SILENT_LOAD = getgenv().RivalsSilentLoad or false
+local AUTO_LOAD   = getgenv().RivalsAutoLoad   or false
+
+--// =============================================
+--// [2] SERVICES
 --// =============================================
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
@@ -24,10 +37,10 @@ local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
 
 --// =============================================
---// [2] RIVALS CAMERA CONTROLLER
+--// [3] RIVALS CAMERA CONTROLLER
 --// Rivals overrides Camera.CFrame every frame
---// we must use CameraController.Rotation and
---// CameraController:SetRotation(Vector2)
+--// must use CameraController.Rotation (Vector2)
+--// and CameraController:SetRotation(Vector2)
 --// =============================================
 local CameraController = nil
 
@@ -69,56 +82,16 @@ if not CameraController then
 end
 
 --// =============================================
---// [3] SETTINGS
+--// [4] SETTINGS
 --// =============================================
 local Settings = {
-    Enabled        = false,
-    AimHead        = true,
-    ShowFOV        = false,
-    FOVRadius      = 150,
-
-    -- CURVE AIM SETTINGS
-    CurveIntensity = 40,    -- 0-100: how much the path curves
-    ArrivalTime    = 0.25,  -- 0.05-1.00: seconds to reach target
-    Overshoot      = 10,    -- 0-50: % past target before settling
-    Wobble         = 3,     -- 0-20: hand shake simulation
-    SettleSpeed    = 8,     -- 1-20: correction speed after overshoot
-}
-
---// =============================================
---// [4] BEZIER STATE MACHINE
---//
---// Phases:
---//   IDLE     → no target
---//   CURVING  → following bezier arc to target
---//   SETTLING → correcting overshoot back to target
---//   TRACKING → on target with wobble
---//
---// Flow:
---//   [target found] → CURVING → SETTLING → TRACKING
---//   [target lost]  → IDLE
---//   [target changed] → restart CURVING
---// =============================================
-local Bezier = {
-    phase          = "idle",
-
-    -- bezier curve data (set at acquisition)
-    startRot       = Vector2.new(0, 0),  -- P0: rotation when target acquired
-    cpPitch        = 0,                   -- control point pitch delta
-    cpYaw          = 0,                   -- control point yaw delta
-    endPitch       = 0,                   -- end point pitch delta (with overshoot)
-    endYaw         = 0,                   -- end point yaw delta (with overshoot)
-    curveDir       = 1,                   -- 1 or -1: which side the arc goes
-
-    -- timing
-    startTime      = 0,
-
-    -- target tracking
-    targetPlayer   = nil,
-    targetPart     = nil,
-
-    -- wobble randomization
-    wobbleSeed     = 0,
+    Enabled      = AUTO_LOAD,
+    AimHead      = true,
+    ShowFOV      = false,
+    FOVRadius    = 150,
+    Smoothness   = 15,        -- 1-100, divided by 100
+    TeamCheck    = false,
+    VisibleCheck = false,
 }
 
 --// =============================================
@@ -147,61 +120,82 @@ local function getScreenCenter()
 end
 
 -- wrap angle difference into [-pi, pi]
--- prevents camera spinning 360 when crossing boundary
+-- prevents camera spinning 360 degrees
 local function angleDiff(from, to)
     local d = to - from
     return ((d + math.pi) % (math.pi * 2)) - math.pi
 end
 
--- smoothstep: accelerates then decelerates
--- makes the bezier movement feel natural
--- like a real hand starting and stopping
-local function smoothstep(t)
-    return t * t * (3 - 2 * t)
+--// =============================================
+--// [7] TEAM CHECK
+--// supports Team object and TeamColor fallback
+--// =============================================
+local function isSameTeam(player)
+    if not player or not LocalPlayer then return false end
+
+    local ok1, r1 = pcall(function()
+        if player.Team and LocalPlayer.Team then
+            return player.Team == LocalPlayer.Team
+        end
+        return false
+    end)
+    if ok1 and r1 then return true end
+
+    local ok2, r2 = pcall(function()
+        if player.TeamColor and LocalPlayer.TeamColor then
+            return player.TeamColor == LocalPlayer.TeamColor
+        end
+        return false
+    end)
+    if ok2 and r2 then return true end
+
+    return false
 end
 
--- quadratic bezier: B(t) = (1-t)²P0 + 2(1-t)tP1 + t²P2
--- P0 is always 0 (start of delta space)
--- returns the delta value at parameter t
-local function bezierDelta(t, cp, ep)
-    local u = 1 - t
-    return 2 * u * t * cp + t * t * ep
+--// =============================================
+--// [8] VISIBILITY CHECK
+--// separate raycast from camera to target
+--// independent from aimbot camera logic
+--// =============================================
+local function isVisible(targetPart)
+    if not targetPart then return false end
+
+    local ok, result = pcall(function()
+        local origin    = Camera.CFrame.Position
+        local direction = (targetPart.Position - origin)
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+
+        local filterList = {Camera}
+        if LocalPlayer.Character then
+            table.insert(filterList, LocalPlayer.Character)
+        end
+        params.FilterDescendantsInstances = filterList
+
+        local hit = workspace:Raycast(origin, direction, params)
+
+        if hit then
+            return hit.Instance:IsDescendantOf(targetPart.Parent)
+        end
+        return true
+    end)
+
+    return ok and result or false
 end
 
--- calculate pitch and yaw from a direction vector
--- pitch = vertical angle: math.asin(Y)
--- yaw   = horizontal angle: math.atan2(-X, -Z)
-local function dirToAngles(dirUnit)
-    return math.asin(dirUnit.Y), math.atan2(-dirUnit.X, -dirUnit.Z)
-end
-
--- multi-frequency wobble for organic hand shake
--- uses 3 sine waves at different frequencies
--- so the pattern never looks repetitive
-local function getWobble(seed, amount)
-    local t = tick()
-    local w = amount / 1000 -- scale: wobble 20 → 0.02 rad ≈ 1.1°
-
-    local pitch = math.sin(t * 7.3 + seed) * w * 0.55
-                + math.sin(t * 13.1 + seed * 1.7) * w * 0.30
-                + math.sin(t * 23.7 + seed * 2.3) * w * 0.15
-
-    local yaw   = math.cos(t * 5.7 + seed * 0.8) * w * 0.55
-                + math.cos(t * 11.3 + seed * 1.4) * w * 0.30
-                + math.cos(t * 19.9 + seed * 2.1) * w * 0.15
-
-    return pitch, yaw
-end
-
--- find closest enemy to screen center within FOV
+--// =============================================
+--// [9] FIND CLOSEST TARGET IN FOV
+--// respects TeamCheck and VisibleCheck
+--// =============================================
 local function getTarget()
     local center   = getScreenCenter()
     local bestPart = nil
-    local bestPlr  = nil
     local bestDist = Settings.FOVRadius
 
     for _, player in ipairs(Players:GetPlayers()) do
         if player == LocalPlayer then continue end
+        if Settings.TeamCheck and isSameTeam(player) then continue end
 
         local char = player.Character
         if not char then continue end
@@ -213,6 +207,8 @@ local function getTarget()
         local part = char:FindFirstChild(partName)
         if not part then continue end
 
+        if Settings.VisibleCheck and not isVisible(part) then continue end
+
         local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
         if not onScreen then continue end
 
@@ -220,92 +216,19 @@ local function getTarget()
         if dist < bestDist then
             bestDist = dist
             bestPart = part
-            bestPlr  = player
         end
     end
 
-    return bestPart, bestPlr
+    return bestPart
 end
 
 --// =============================================
---// [7] BEZIER CURVE SETUP
---// called when a new target is acquired
---// calculates the curved path from current
---// rotation to target rotation
---// =============================================
-local function setupBezierCurve(targetPart)
-    local camPos  = Camera.CFrame.Position
-    local dirUnit = (targetPart.Position - camPos).Unit
-
-    -- current rotation (start point)
-    local startRot = CameraController.Rotation
-
-    -- target angles
-    local tgtPitch, tgtYaw = dirToAngles(dirUnit)
-
-    -- angle deltas (yaw wrapped to shortest path)
-    local dp = tgtPitch - startRot.X
-    local dy = angleDiff(startRot.Y, tgtYaw)
-
-    -- path length in angle space
-    local pathLen = math.sqrt(dp * dp + dy * dy)
-
-    -- randomize which side the curve arcs to
-    -- alternates left/right for variety
-    local curveDir = (math.random() > 0.5) and 1 or -1
-
-    -- CONTROL POINT CALCULATION
-    -- placed at midpoint of straight line
-    -- then offset perpendicular by CurveIntensity
-    --
-    -- perpendicular direction in 2D:
-    --   if path goes (dp, dy), perpendicular is (-dy, dp)
-    --   normalized then scaled by intensity
-    local cpPitch, cpYaw
-
-    if pathLen > 0.001 then
-        local perpPitch = -dy / pathLen
-        local perpYaw   =  dp / pathLen
-
-        local curveMag = (Settings.CurveIntensity / 100) * pathLen * 0.6 * curveDir
-
-        cpPitch = dp * 0.5 + perpPitch * curveMag
-        cpYaw   = dy * 0.5 + perpYaw   * curveMag
-    else
-        cpPitch = 0
-        cpYaw   = 0
-    end
-
-    -- END POINT WITH OVERSHOOT
-    -- extends past target by Overshoot percentage
-    -- e.g. 10% overshoot: endpoint is 110% of the way
-    local ovFactor = 1 + Settings.Overshoot / 100
-
-    -- store everything in Bezier state
-    Bezier.phase     = "curving"
-    Bezier.startRot  = startRot
-    Bezier.cpPitch   = cpPitch
-    Bezier.cpYaw     = cpYaw
-    Bezier.endPitch  = dp * ovFactor
-    Bezier.endYaw    = dy * ovFactor
-    Bezier.curveDir  = curveDir
-    Bezier.startTime = tick()
-    Bezier.wobbleSeed = math.random() * 100
-end
-
---// =============================================
---// [8] PHASE STATUS LABEL (updated in render)
---// =============================================
-local phaseStatusLabel = nil -- set later when UI is built
-
---// =============================================
---// [9] MAIN RENDER LOOP
---//
+--// [10] MAIN RENDER LOOP
 --// every frame:
 --//   1. update FOV circle
---//   2. find target
---//   3. handle target switching
---//   4. execute current phase logic
+--//   2. find closest target
+--//   3. calculate pitch/yaw angles
+--//   4. smoothly lerp camera rotation
 --// =============================================
 local renderConnection
 
@@ -321,166 +244,43 @@ renderConnection = RunService.RenderStepped:Connect(function()
         end)
     end
 
-    -- update status label
-    if phaseStatusLabel then
-        pcall(function()
-            if not Settings.Enabled then
-                phaseStatusLabel.Text = "Phase: OFF"
-            else
-                phaseStatusLabel.Text = "Phase: " .. Bezier.phase:upper()
-            end
-        end)
-    end
-
-    -- bail if disabled or no camera controller
-    if not Settings.Enabled then
-        Bezier.phase = "idle"
-        Bezier.targetPlayer = nil
-        Bezier.targetPart = nil
-        return
-    end
+    if not Settings.Enabled then return end
     if not CameraController then return end
 
-    -- find target
-    local targetPart, targetPlayer = getTarget()
+    local targetPart = getTarget()
+    if not targetPart then return end
 
-    if not targetPart then
-        -- lost target → reset to idle
-        Bezier.phase = "idle"
-        Bezier.targetPlayer = nil
-        Bezier.targetPart = nil
-        return
-    end
+    pcall(function()
+        local camPos  = Camera.CFrame.Position
+        local dirUnit = (targetPart.Position - camPos).Unit
 
-    -- ————————————————————————————————
-    -- TARGET SWITCH DETECTION
-    -- if player changed, restart the curve
-    -- ————————————————————————————————
-    if targetPlayer ~= Bezier.targetPlayer then
-        Bezier.targetPlayer = targetPlayer
-        Bezier.targetPart   = targetPart
+        -- calculate target angles
+        -- pitch = vertical: math.asin(Y)
+        -- yaw = horizontal: math.atan2(-X, -Z)
+        local targetPitch = math.asin(dirUnit.Y)
+        local targetYaw   = math.atan2(-dirUnit.X, -dirUnit.Z)
 
-        pcall(function()
-            setupBezierCurve(targetPart)
-        end)
-        return -- skip this frame, curve starts next frame
-    end
+        -- get current rotation from CameraController
+        local current = CameraController.Rotation
 
-    Bezier.targetPart = targetPart
+        -- smoothness: slider 1-100 → divide by 100 → lerp alpha
+        -- low value = slow smooth tracking
+        -- high value = fast snappy lock
+        local alpha = Settings.Smoothness / 100
 
-    -- ————————————————————————————————
-    -- PHASE: CURVING
-    -- follow the bezier arc from start to target
-    -- t progresses from 0 to 1 over ArrivalTime
-    -- uses smoothstep easing for natural feel
-    -- ————————————————————————————————
-    if Bezier.phase == "curving" then
-        pcall(function()
-            local elapsed = tick() - Bezier.startTime
-            local arrTime = math.max(Settings.ArrivalTime, 0.01)
-            local rawT    = math.clamp(elapsed / arrTime, 0, 1)
-            local t       = smoothstep(rawT)
+        -- lerp pitch directly (no wrapping needed)
+        local newPitch = current.X + (targetPitch - current.X) * alpha
 
-            -- compute bezier delta at parameter t
-            -- P0 = (0,0), P1 = (cpPitch, cpYaw), P2 = (endPitch, endYaw)
-            local bPitch = bezierDelta(t, Bezier.cpPitch, Bezier.endPitch)
-            local bYaw   = bezierDelta(t, Bezier.cpYaw,   Bezier.endYaw)
+        -- lerp yaw with angle wrapping
+        local newYaw = current.Y + angleDiff(current.Y, targetYaw) * alpha
 
-            -- apply: startRotation + bezierDelta
-            local newPitch = Bezier.startRot.X + bPitch
-            local newYaw   = Bezier.startRot.Y + bYaw
-
-            CameraController:SetRotation(Vector2.new(newPitch, newYaw))
-
-            -- when curve completes, move to settling
-            if rawT >= 1 then
-                Bezier.phase = "settling"
-            end
-        end)
-        return
-    end
-
-    -- ————————————————————————————————
-    -- PHASE: SETTLING
-    -- correct overshoot back to actual target
-    -- lerps from current overshot position
-    -- toward real target position
-    -- ————————————————————————————————
-    if Bezier.phase == "settling" then
-        pcall(function()
-            local camPos  = Camera.CFrame.Position
-            local dirUnit = (targetPart.Position - camPos).Unit
-
-            local tgtPitch, tgtYaw = dirToAngles(dirUnit)
-            local current = CameraController.Rotation
-
-            -- settle alpha from SettleSpeed (1-20 → 0.05-1.0)
-            local alpha = Settings.SettleSpeed / 20
-
-            local newPitch = current.X + (tgtPitch - current.X) * alpha
-            local newYaw   = current.Y + angleDiff(current.Y, tgtYaw) * alpha
-
-            CameraController:SetRotation(Vector2.new(newPitch, newYaw))
-
-            -- check if close enough to actual target
-            -- threshold: ~0.5 degrees
-            local pDiff = math.abs(tgtPitch - newPitch)
-            local yDiff = math.abs(angleDiff(newYaw, tgtYaw))
-
-            if pDiff < 0.008 and yDiff < 0.008 then
-                Bezier.phase = "tracking"
-            end
-        end)
-        return
-    end
-
-    -- ————————————————————————————————
-    -- PHASE: TRACKING
-    -- stay on target with natural wobble
-    -- simulates human hand micro-movements
-    -- multiple sine waves create organic feel
-    -- ————————————————————————————————
-    if Bezier.phase == "tracking" then
-        pcall(function()
-            local camPos  = Camera.CFrame.Position
-            local dirUnit = (targetPart.Position - camPos).Unit
-
-            local tgtPitch, tgtYaw = dirToAngles(dirUnit)
-
-            -- add wobble for human-like aim
-            local wPitch, wYaw = 0, 0
-            if Settings.Wobble > 0 then
-                wPitch, wYaw = getWobble(Bezier.wobbleSeed, Settings.Wobble)
-            end
-
-            local goalPitch = tgtPitch + wPitch
-            local goalYaw   = tgtYaw   + wYaw
-
-            -- smooth tracking (uses SettleSpeed)
-            local current = CameraController.Rotation
-            local alpha   = Settings.SettleSpeed / 20
-
-            local newPitch = current.X + (goalPitch - current.X) * alpha
-            local newYaw   = current.Y + angleDiff(current.Y, goalYaw) * alpha
-
-            CameraController:SetRotation(Vector2.new(newPitch, newYaw))
-        end)
-        return
-    end
-
-    -- ————————————————————————————————
-    -- PHASE: IDLE (shouldn't reach here with target)
-    -- safety: if somehow idle with target, start curve
-    -- ————————————————————————————————
-    if Bezier.phase == "idle" and targetPart then
-        pcall(function()
-            setupBezierCurve(targetPart)
-        end)
-    end
+        -- apply rotation
+        CameraController:SetRotation(Vector2.new(newPitch, newYaw))
+    end)
 end)
 
 --// =============================================
---// [10] UI COLOR PALETTE
+--// [11] UI COLOR PALETTE
 --// =============================================
 local C = {
     bg          = Color3.fromRGB(14, 14, 24),
@@ -488,6 +288,7 @@ local C = {
     surfaceHi   = Color3.fromRGB(32, 32, 52),
     accent      = Color3.fromRGB(120, 60, 230),
     accentDim   = Color3.fromRGB(75, 30, 145),
+    accentGlow  = Color3.fromRGB(155, 85, 255),
     text        = Color3.fromRGB(225, 225, 240),
     textDim     = Color3.fromRGB(120, 120, 150),
     toggleOff   = Color3.fromRGB(45, 45, 65),
@@ -496,14 +297,12 @@ local C = {
     danger      = Color3.fromRGB(210, 50, 50),
     success     = Color3.fromRGB(60, 210, 90),
     section     = Color3.fromRGB(150, 85, 255),
-    phaseIdle   = Color3.fromRGB(120, 120, 150),
-    phaseCurve  = Color3.fromRGB(100, 200, 255),
-    phaseSettle = Color3.fromRGB(255, 180, 50),
-    phaseTrack  = Color3.fromRGB(60, 210, 90),
+    floatBtn    = Color3.fromRGB(120, 60, 230),
+    floatBtnHi  = Color3.fromRGB(155, 85, 255),
 }
 
 --// =============================================
---// [11] SCREENGUI
+--// [12] SCREENGUI
 --// =============================================
 pcall(function()
     local old = CoreGui:FindFirstChild("RivalsAimbotGui")
@@ -524,23 +323,80 @@ end)
 screenGui.Parent = CoreGui
 
 --// =============================================
---// [12] MAIN FRAME
+--// [13] MAIN WINDOW
 --// =============================================
 local mainFrame = Instance.new("Frame")
 mainFrame.Name             = "MainWindow"
-mainFrame.Size             = UDim2.new(0, 270, 0, 470)
-mainFrame.Position         = UDim2.new(0.5, -135, 0.06, 0)
+mainFrame.Size             = UDim2.new(0, 270, 0, 400)
+mainFrame.Position         = UDim2.new(0.5, -135, 0.08, 0)
 mainFrame.BackgroundColor3 = C.bg
 mainFrame.BorderSizePixel  = 0
+mainFrame.Visible          = not SILENT_LOAD
 mainFrame.Parent           = screenGui
 
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 14)
 
-local ms = Instance.new("UIStroke")
-ms.Color = C.accentDim; ms.Thickness = 1.5; ms.Transparency = 0.3; ms.Parent = mainFrame
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = C.accentDim; mainStroke.Thickness = 1.5
+mainStroke.Transparency = 0.3; mainStroke.Parent = mainFrame
 
 --// =============================================
---// [13] TITLE BAR
+--// [14] FLOATING TOGGLE BUTTON
+--// always visible, tap to show/hide window
+--// draggable to reposition anywhere on screen
+--// =============================================
+local floatBtn = Instance.new("TextButton")
+floatBtn.Name             = "FloatToggle"
+floatBtn.Size             = UDim2.new(0, 46, 0, 46)
+floatBtn.Position         = UDim2.new(0, 14, 0.45, 0)
+floatBtn.BackgroundColor3 = C.floatBtn
+floatBtn.Text             = SILENT_LOAD and "⚡" or "✕"
+floatBtn.TextColor3       = Color3.new(1, 1, 1)
+floatBtn.TextSize         = 20
+floatBtn.Font             = Enum.Font.GothamBold
+floatBtn.BorderSizePixel  = 0
+floatBtn.AutoButtonColor  = false
+floatBtn.ZIndex           = 10
+floatBtn.Parent           = screenGui
+
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 23)
+
+local fStroke = Instance.new("UIStroke")
+fStroke.Color = C.accentGlow; fStroke.Thickness = 2; fStroke.Parent = floatBtn
+
+local fGlow = Instance.new("UIStroke")
+fGlow.Color = C.accentGlow; fGlow.Thickness = 4
+fGlow.Transparency = 0.7; fGlow.Parent = floatBtn
+
+-- tap to toggle window
+floatBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = not mainFrame.Visible
+    floatBtn.Text = mainFrame.Visible and "✕" or "⚡"
+    local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    TweenService:Create(floatBtn, info, {BackgroundColor3 = C.floatBtnHi}):Play()
+    task.delay(0.15, function()
+        pcall(function()
+            TweenService:Create(floatBtn, info, {BackgroundColor3 = C.floatBtn}):Play()
+        end)
+    end)
+end)
+
+-- float button draggable
+local floatDragging  = false
+local floatDragStart = Vector2.zero
+local floatStartPos  = UDim2.new()
+
+floatBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+    or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        floatDragging  = true
+        floatDragStart = Vector2.new(input.Position.X, input.Position.Y)
+        floatStartPos  = floatBtn.Position
+    end
+end)
+
+--// =============================================
+--// [15] TITLE BAR
 --// =============================================
 local titleBar = Instance.new("Frame")
 titleBar.Name = "TitleBar"; titleBar.Size = UDim2.new(1, 0, 0, 44)
@@ -551,8 +407,8 @@ Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 14)
 
 local tbFix = Instance.new("Frame")
 tbFix.Size = UDim2.new(1, 0, 0, 14); tbFix.Position = UDim2.new(0, 0, 1, -14)
-tbFix.BackgroundColor3 = C.surface; tbFix.BorderSizePixel = 0; tbFix.ZIndex = 5
-tbFix.Parent = titleBar
+tbFix.BackgroundColor3 = C.surface; tbFix.BorderSizePixel = 0
+tbFix.ZIndex = 5; tbFix.Parent = titleBar
 
 local accentLine = Instance.new("Frame")
 accentLine.Size = UDim2.new(1, -24, 0, 2); accentLine.Position = UDim2.new(0, 12, 1, 0)
@@ -561,22 +417,28 @@ accentLine.ZIndex = 6; accentLine.Parent = titleBar
 
 local titleLabel = Instance.new("TextLabel")
 titleLabel.Size = UDim2.new(1, -56, 1, 0); titleLabel.Position = UDim2.new(0, 16, 0, 0)
-titleLabel.BackgroundTransparency = 1; titleLabel.Text = "🌊 Curve Aimbot"
+titleLabel.BackgroundTransparency = 1; titleLabel.Text = "⚡ Rivals Aimbot"
 titleLabel.TextColor3 = C.text; titleLabel.TextSize = 15
 titleLabel.Font = Enum.Font.GothamBold; titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.ZIndex = 6; titleLabel.Parent = titleBar
 
+-- minimize button (hides window)
 local closeBtn = Instance.new("TextButton")
 closeBtn.Size = UDim2.new(0, 28, 0, 28); closeBtn.Position = UDim2.new(1, -36, 0, 8)
-closeBtn.BackgroundColor3 = C.danger; closeBtn.Text = "✕"
-closeBtn.TextColor3 = Color3.new(1,1,1); closeBtn.TextSize = 13
+closeBtn.BackgroundColor3 = C.danger; closeBtn.Text = "—"
+closeBtn.TextColor3 = Color3.new(1, 1, 1); closeBtn.TextSize = 16
 closeBtn.Font = Enum.Font.GothamBold; closeBtn.BorderSizePixel = 0
 closeBtn.ZIndex = 7; closeBtn.Parent = titleBar
 
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
 
+closeBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = false
+    floatBtn.Text = "⚡"
+end)
+
 --// =============================================
---// [14] SCROLL CONTENT
+--// [16] SCROLLING CONTENT AREA
 --// =============================================
 local content = Instance.new("ScrollingFrame")
 content.Name = "Content"; content.Size = UDim2.new(1, 0, 1, -50)
@@ -594,7 +456,8 @@ cp.PaddingBottom = UDim.new(0, 14); cp.PaddingLeft = UDim.new(0, 10)
 cp.PaddingRight = UDim.new(0, 10); cp.Parent = content
 
 --// =============================================
---// [15] GLOBAL DRAG + SLIDER HANDLER
+--// [17] GLOBAL INPUT HANDLER
+--// window drag + float button drag + slider drag
 --// =============================================
 local windowDragging  = false
 local windowDragStart = Vector2.zero
@@ -622,17 +485,25 @@ UserInputService.InputChanged:Connect(function(input)
         )
     end
 
+    if floatDragging then
+        local d = Vector2.new(input.Position.X, input.Position.Y) - floatDragStart
+        floatBtn.Position = UDim2.new(
+            floatStartPos.X.Scale, floatStartPos.X.Offset + d.X,
+            floatStartPos.Y.Scale, floatStartPos.Y.Offset + d.Y
+        )
+    end
+
     if activeSlider then
-        local s    = activeSlider
-        local tX   = s.track.AbsolutePosition.X
-        local tW   = s.track.AbsoluteSize.X
-        local pct  = math.clamp((input.Position.X - tX) / tW, 0, 1)
-        local val  = s.snap(s.min + pct * (s.max - s.min))
+        local s   = activeSlider
+        local tX  = s.track.AbsolutePosition.X
+        local tW  = s.track.AbsoluteSize.X
+        local pct = math.clamp((input.Position.X - tX) / tW, 0, 1)
+        local val = s.snap(s.min + pct * (s.max - s.min))
         pct = math.clamp((val - s.min) / (s.max - s.min), 0, 1)
 
         s.fill.Size      = UDim2.new(pct, 0, 1, 0)
         s.thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        s.label.Text     = s.name .. ": " .. string.format(s.fmt, val)
+        s.label.Text     = s.name .. ": " .. tostring(val)
         s.value = val
         if s.callback then s.callback(val) end
     end
@@ -642,12 +513,13 @@ UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch
     or input.UserInputType == Enum.UserInputType.MouseButton1 then
         windowDragging = false
+        floatDragging  = false
         activeSlider   = nil
     end
 end)
 
 --// =============================================
---// [16] UI COMPONENT BUILDERS
+--// [18] UI COMPONENT BUILDERS
 --// =============================================
 local layoutOrder = 0
 local function nextOrder() layoutOrder = layoutOrder + 1; return layoutOrder end
@@ -728,15 +600,10 @@ end
 
 local function createSlider(name, min, max, default, step, callback)
     step = step or 1
-    local decimals = 0
-    local ss = tostring(step); local dot = ss:find("%.")
-    if dot then decimals = #ss - dot end
-    local fmt = "%." .. decimals .. "f"
 
     local function snap(raw)
         local v = math.floor(raw / step + 0.5) * step
-        v = math.clamp(v, min, max)
-        return tonumber(string.format(fmt, v))
+        return math.clamp(v, min, max)
     end
 
     local initPct = math.clamp((default - min) / (max - min), 0, 1)
@@ -748,7 +615,7 @@ local function createSlider(name, min, max, default, step, callback)
 
     local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -24, 0, 20)
     lbl.Position = UDim2.new(0, 12, 0, 4); lbl.BackgroundTransparency = 1
-    lbl.Text = name..": "..string.format(fmt, default); lbl.TextColor3 = C.textDim
+    lbl.Text = name..": "..tostring(default); lbl.TextColor3 = C.textDim
     lbl.TextSize = 12; lbl.Font = Enum.Font.GothamMedium
     lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
 
@@ -770,7 +637,7 @@ local function createSlider(name, min, max, default, step, callback)
 
     local data = {
         track = track, fill = fill, thumb = thumb, label = lbl,
-        name = name, min = min, max = max, snap = snap, fmt = fmt,
+        name = name, min = min, max = max, snap = snap,
         value = default, callback = callback,
     }
 
@@ -785,7 +652,7 @@ local function createSlider(name, min, max, default, step, callback)
         local val = snap(min + pct * (max - min))
         pct = math.clamp((val - min) / (max - min), 0, 1)
         fill.Size = UDim2.new(pct, 0, 1, 0); thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        lbl.Text = name..": "..string.format(fmt, val); data.value = val
+        lbl.Text = name..": "..tostring(val); data.value = val
         if callback then callback(val) end
     end
 
@@ -800,29 +667,28 @@ local function createSlider(name, min, max, default, step, callback)
 end
 
 --// =============================================
---// [17] BUILD UI ELEMENTS
+--// [19] BUILD ALL UI ELEMENTS
 --// =============================================
 
--- status
+-- status line
 if CameraController then
     createStatus("✓ CameraController connected", C.success)
 else
     createStatus("✗ CameraController not found", Color3.fromRGB(255, 180, 50))
 end
 
--- phase indicator
-phaseStatusLabel = createStatus("Phase: IDLE", C.phaseIdle)
+if SILENT_LOAD then
+    createStatus("🔇 Silent Load active", C.textDim)
+end
+if AUTO_LOAD then
+    createStatus("⚡ Auto Load — aimbot enabled", C.accentGlow)
+end
 
 createDivider()
-createSection("TARGETING")
+createSection("AIMBOT")
 
-createToggle("Aimbot", false, function(v)
+createToggle("Aimbot", AUTO_LOAD, function(v)
     Settings.Enabled = v
-    if not v then
-        Bezier.phase = "idle"
-        Bezier.targetPlayer = nil
-        Bezier.targetPart = nil
-    end
 end)
 
 createToggle("Aim At Head", true, function(v)
@@ -837,57 +703,26 @@ createSlider("FOV Radius", 10, 500, 150, 1, function(v)
     Settings.FOVRadius = v
 end)
 
-createDivider()
-createSection("CURVE PATH")
-
-createSlider("Curve Intensity", 0, 100, 40, 1, function(v)
-    Settings.CurveIntensity = v
-end)
-
-createSlider("Arrival Time", 0.05, 1.00, 0.25, 0.01, function(v)
-    Settings.ArrivalTime = v
-end)
-
-createSlider("Overshoot", 0, 50, 10, 1, function(v)
-    Settings.Overshoot = v
+createSlider("Smoothness", 1, 100, 15, 1, function(v)
+    Settings.Smoothness = v
 end)
 
 createDivider()
-createSection("TRACKING")
+createSection("CHECKS")
 
-createSlider("Wobble", 0, 20, 3, 1, function(v)
-    Settings.Wobble = v
+createToggle("Team Check", false, function(v)
+    Settings.TeamCheck = v
 end)
 
-createSlider("Settle Speed", 1, 20, 8, 1, function(v)
-    Settings.SettleSpeed = v
-end)
-
---// =============================================
---// [18] PHASE STATUS COLOR UPDATE
---// =============================================
-local phaseColorConn = RunService.Heartbeat:Connect(function()
-    if not phaseStatusLabel then return end
-    pcall(function()
-        local phase = Bezier.phase
-        if phase == "idle" then
-            phaseStatusLabel.TextColor3 = C.phaseIdle
-        elseif phase == "curving" then
-            phaseStatusLabel.TextColor3 = C.phaseCurve
-        elseif phase == "settling" then
-            phaseStatusLabel.TextColor3 = C.phaseSettle
-        elseif phase == "tracking" then
-            phaseStatusLabel.TextColor3 = C.phaseTrack
-        end
-    end)
+createToggle("Visible Check", false, function(v)
+    Settings.VisibleCheck = v
 end)
 
 --// =============================================
---// [19] CLOSE + CLEANUP
+--// [20] CLEANUP
 --// =============================================
 local function fullCleanup()
     pcall(function() renderConnection:Disconnect() end)
-    pcall(function() phaseColorConn:Disconnect() end)
     pcall(function()
         if fovCircle then fovCircle.Visible = false; fovCircle:Remove(); fovCircle = nil end
     end)
@@ -896,4 +731,3 @@ local function fullCleanup()
 end
 
 getgenv().RivalsAimbotCleanup = fullCleanup
-closeBtn.MouseButton1Click:Connect(fullCleanup)
