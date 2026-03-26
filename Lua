@@ -1,8 +1,9 @@
 --// =============================================
---// RIVALS MOBILE AIMBOT — KICIAHOOK STYLE
---// Speed · SpeedScale-FOV · Lock Control
---// Config Save/Load · Sensitivity Matching
---// Team Check · Visible Check · Silent Load
+--// RIVALS MOBILE AIMBOT
+--// Smoothness · Delay Position (X/Y/Jump Smooth)
+--// Closest Part · Closest Position
+--// Config Save/Load · Team/Visible Check
+--// Silent Load · Floating Button
 --// Pure Instance UI · Rivals CameraController
 --// =============================================
 
@@ -36,15 +37,12 @@ local Camera      = workspace.CurrentCamera
 --// [3] CONFIG FOLDER
 --// =============================================
 local CONFIG_FOLDER = "RivalsAimbot"
-
 pcall(function()
-    if not isfolder(CONFIG_FOLDER) then
-        makefolder(CONFIG_FOLDER)
-    end
+    if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
 end)
 
 --// =============================================
---// [4] RIVALS CAMERA CONTROLLER
+--// [4] CAMERA CONTROLLER
 --// =============================================
 local CameraController = nil
 
@@ -93,96 +91,78 @@ local Settings = {
     AimHead        = true,
     ShowFOV        = false,
     FOVRadius      = 150,
+    Smoothness     = 15,
     TeamCheck      = false,
     VisibleCheck   = false,
 
-    -- KICIAHOOK SPEED
-    Speed          = 1.50,
-    SpeedInAttack  = 2.50,
-    SpeedScaleFOV  = 50,
-    MaxLockOn      = 0,
-    ReactionTime   = 0,
+    -- DELAY POSITION
+    -- separate X (yaw) and Y (pitch) smoothing
+    -- allows different horizontal vs vertical speed
+    -- JumpSmoothing slows tracking on airborne targets
+    XSmooth        = 100,    -- 1-100%: horizontal aim speed
+    YSmooth        = 100,    -- 1-100%: vertical aim speed
+    JumpSmoothing  = 50,     -- 1-100%: tracking speed on jumping targets
 
-    -- SENSITIVITY MATCHING
-    -- must match your Rivals in-game settings
-    -- so aimbot speed compensates correctly
-    Sensitivity    = 100,   -- 0-400%
-    ADSSensitivity = 100,   -- 0-200%
+    -- CLOSEST PART
+    -- instead of always Head or HumanoidRootPart
+    -- picks the closest VISIBLE body part to crosshair
+    ClosestPart    = false,
+
+    -- CLOSEST POSITION
+    -- instead of aiming at part center (Position)
+    -- aims at the closest POINT on the part surface
+    -- more precise, especially for headshots
+    ClosestPosition = false,
 }
 
 --// =============================================
---// [6] CONFIG SAVE / LOAD SYSTEM
+--// [6] CONFIG SYSTEM
 --// =============================================
-
--- fields to save (excludes Enabled so it
--- doesnt auto-enable on config load)
 local SAVE_FIELDS = {
-    "AimHead", "ShowFOV", "FOVRadius", "TeamCheck", "VisibleCheck",
-    "Speed", "SpeedInAttack", "SpeedScaleFOV", "MaxLockOn", "ReactionTime",
-    "Sensitivity", "ADSSensitivity",
+    "AimHead", "ShowFOV", "FOVRadius", "Smoothness",
+    "TeamCheck", "VisibleCheck",
+    "XSmooth", "YSmooth", "JumpSmoothing",
+    "ClosestPart", "ClosestPosition",
 }
 
 local function saveConfig(name)
     if not name or name == "" then return false, "Empty name" end
-
     local data = {}
-    for _, key in ipairs(SAVE_FIELDS) do
-        data[key] = Settings[key]
-    end
-
+    for _, key in ipairs(SAVE_FIELDS) do data[key] = Settings[key] end
     local ok, err = pcall(function()
-        local json = HttpService:JSONEncode(data)
-        writefile(CONFIG_FOLDER .. "/" .. name .. ".json", json)
+        writefile(CONFIG_FOLDER .. "/" .. name .. ".json", HttpService:JSONEncode(data))
     end)
-
     return ok, err
 end
 
 local function loadConfig(name)
     if not name or name == "" then return false, "Empty name" end
-
     local path = CONFIG_FOLDER .. "/" .. name .. ".json"
-
     local ok, err = pcall(function()
-        if not isfile(path) then
-            error("Config not found")
-        end
-
-        local json = readfile(path)
-        local data = HttpService:JSONDecode(json)
-
+        if not isfile(path) then error("Config not found") end
+        local data = HttpService:JSONDecode(readfile(path))
         for _, key in ipairs(SAVE_FIELDS) do
-            if data[key] ~= nil then
-                Settings[key] = data[key]
-            end
+            if data[key] ~= nil then Settings[key] = data[key] end
         end
     end)
-
     return ok, err
 end
 
 local function deleteConfig(name)
     if not name or name == "" then return false end
-
     local ok = pcall(function()
         local path = CONFIG_FOLDER .. "/" .. name .. ".json"
-        if isfile(path) then
-            delfile(path)
-        end
+        if isfile(path) then delfile(path) end
     end)
-
     return ok
 end
 
 local function getConfigList()
     local list = {}
     pcall(function()
-        local files = listfiles(CONFIG_FOLDER)
-        for _, path in ipairs(files) do
+        for _, path in ipairs(listfiles(CONFIG_FOLDER)) do
             local name = path:match("([^/\\]+)%.json$")
-            if name then
-                table.insert(list, name)
-            end
+            if name then table.insert(list, name) end
         end
     end)
     table.sort(list)
@@ -190,34 +170,19 @@ local function getConfigList()
 end
 
 --// =============================================
---// [7] LOCK STATE
---// =============================================
-local Lock = {
-    targetPlayer  = nil,
-    lockStartTick = 0,
-    switchTick    = 0,
-    cooldownUntil = 0,
-}
-
---// =============================================
---// [8] FOV CIRCLE
+--// [7] FOV CIRCLE
 --// =============================================
 local fovCircle = nil
-
 pcall(function()
     fovCircle = Drawing.new("Circle")
-    fovCircle.Thickness    = 1.5
-    fovCircle.NumSides     = 64
-    fovCircle.Radius       = Settings.FOVRadius
-    fovCircle.Filled       = false
-    fovCircle.Visible      = false
-    fovCircle.ZIndex       = 999
-    fovCircle.Transparency = 0.8
-    fovCircle.Color        = Color3.fromRGB(255, 255, 255)
+    fovCircle.Thickness = 1.5; fovCircle.NumSides = 64
+    fovCircle.Radius = Settings.FOVRadius; fovCircle.Filled = false
+    fovCircle.Visible = false; fovCircle.ZIndex = 999
+    fovCircle.Transparency = 0.8; fovCircle.Color = Color3.fromRGB(255, 255, 255)
 end)
 
 --// =============================================
---// [9] UTILITY FUNCTIONS
+--// [8] UTILITY FUNCTIONS
 --// =============================================
 
 local function getScreenCenter()
@@ -229,26 +194,15 @@ local function angleDiff(from, to)
     return ((d + math.pi) % (math.pi * 2)) - math.pi
 end
 
-local function isAttacking()
-    local ok, pressed = pcall(function()
-        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
-    end)
-    return ok and pressed
-end
-
 local function isSameTeam(player)
     if not player or not LocalPlayer then return false end
     local ok1, r1 = pcall(function()
-        if player.Team and LocalPlayer.Team then
-            return player.Team == LocalPlayer.Team
-        end
+        if player.Team and LocalPlayer.Team then return player.Team == LocalPlayer.Team end
         return false
     end)
     if ok1 and r1 then return true end
     local ok2, r2 = pcall(function()
-        if player.TeamColor and LocalPlayer.TeamColor then
-            return player.TeamColor == LocalPlayer.TeamColor
-        end
+        if player.TeamColor and LocalPlayer.TeamColor then return player.TeamColor == LocalPlayer.TeamColor end
         return false
     end)
     if ok2 and r2 then return true end
@@ -258,28 +212,124 @@ end
 local function isVisible(targetPart)
     if not targetPart then return false end
     local ok, result = pcall(function()
-        local origin    = Camera.CFrame.Position
+        local origin = Camera.CFrame.Position
         local direction = (targetPart.Position - origin)
-        local params    = RaycastParams.new()
+        local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
         local filterList = {Camera}
-        if LocalPlayer.Character then
-            table.insert(filterList, LocalPlayer.Character)
-        end
+        if LocalPlayer.Character then table.insert(filterList, LocalPlayer.Character) end
         params.FilterDescendantsInstances = filterList
         local hit = workspace:Raycast(origin, direction, params)
-        if hit then
-            return hit.Instance:IsDescendantOf(targetPart.Parent)
-        end
+        if hit then return hit.Instance:IsDescendantOf(targetPart.Parent) end
         return true
     end)
     return ok and result or false
 end
 
+--// =============================================
+--// [9] CLOSEST PART SYSTEM
+--// when enabled, finds the body part whose
+--// screen position is closest to crosshair
+--// instead of always using Head or HumanoidRootPart
+--// =============================================
+local BODY_PARTS = {
+    "Head", "HumanoidRootPart",
+    "UpperTorso", "LowerTorso",
+    "LeftUpperArm", "RightUpperArm",
+    "LeftLowerArm", "RightLowerArm",
+    "LeftUpperLeg", "RightUpperLeg",
+    "LeftLowerLeg", "RightLowerLeg",
+    -- R6 fallbacks
+    "Torso", "Left Arm", "Right Arm",
+    "Left Leg", "Right Leg",
+}
+
+local function getClosestPart(character)
+    local center   = getScreenCenter()
+    local bestPart = nil
+    local bestDist = math.huge
+
+    for _, partName in ipairs(BODY_PARTS) do
+        local part = character:FindFirstChild(partName)
+        if not part or not part:IsA("BasePart") then continue end
+
+        local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
+        if not onScreen then continue end
+
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+        if dist < bestDist then
+            bestDist = dist
+            bestPart = part
+        end
+    end
+
+    return bestPart
+end
+
+--// =============================================
+--// [10] CLOSEST POSITION SYSTEM
+--// when enabled, finds the closest POINT on the
+--// part surface to the camera look ray
+--// instead of aiming at part center (Position)
+--//
+--// uses the part's bounding box to clamp the
+--// aim point to the nearest surface point
+--// =============================================
+local function getClosestPointOnPart(part)
+    if not part then return nil end
+
+    local ok, result = pcall(function()
+        local camPos = Camera.CFrame.Position
+        local camLook = Camera.CFrame.LookVector
+
+        -- transform camera position into part local space
+        local partCF   = part.CFrame
+        local partSize = part.Size / 2
+
+        local localCamPos = partCF:PointToObjectSpace(camPos)
+
+        -- clamp the local camera position to the part bounds
+        -- this gives us the nearest point on the surface
+        local clampedX = math.clamp(localCamPos.X, -partSize.X, partSize.X)
+        local clampedY = math.clamp(localCamPos.Y, -partSize.Y, partSize.Y)
+        local clampedZ = math.clamp(localCamPos.Z, -partSize.Z, partSize.Z)
+
+        local localClosest = Vector3.new(clampedX, clampedY, clampedZ)
+
+        -- convert back to world space
+        return partCF:PointToWorldSpace(localClosest)
+    end)
+
+    return ok and result or part.Position
+end
+
+--// =============================================
+--// [11] CHECK IF TARGET IS AIRBORNE
+--// used for JumpSmoothing — reduces tracking
+--// speed when target is in the air
+--// =============================================
+local function isAirborne(character)
+    if not character then return false end
+
+    local ok, result = pcall(function()
+        local hum = character:FindFirstChildOfClass("Humanoid")
+        if not hum then return false end
+
+        local state = hum:GetState()
+        return state == Enum.HumanoidStateType.Freefall
+            or state == Enum.HumanoidStateType.Jumping
+            or state == Enum.HumanoidStateType.FallingDown
+    end)
+
+    return ok and result or false
+end
+
+--// =============================================
+--// [12] FIND TARGET
+--// =============================================
 local function getTarget()
     local center   = getScreenCenter()
     local bestPart = nil
-    local bestPlr  = nil
     local bestDist = Settings.FOVRadius
 
     for _, player in ipairs(Players:GetPlayers()) do
@@ -292,10 +342,19 @@ local function getTarget()
         local hum = char:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then continue end
 
-        local partName = Settings.AimHead and "Head" or "HumanoidRootPart"
-        local part = char:FindFirstChild(partName)
-        if not part then continue end
+        -- select which part to use
+        local part
 
+        if Settings.ClosestPart then
+            -- find body part closest to crosshair
+            part = getClosestPart(char)
+        else
+            -- default: Head or HumanoidRootPart
+            local partName = Settings.AimHead and "Head" or "HumanoidRootPart"
+            part = char:FindFirstChild(partName)
+        end
+
+        if not part then continue end
         if Settings.VisibleCheck and not isVisible(part) then continue end
 
         local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
@@ -305,51 +364,24 @@ local function getTarget()
         if dist < bestDist then
             bestDist = dist
             bestPart = part
-            bestPlr  = player
         end
     end
 
-    return bestPart, bestPlr, bestDist
+    return bestPart
 end
 
 --// =============================================
---// [10] SENSITIVITY FACTOR
+--// [13] MAIN RENDER LOOP
 --//
---// Rivals default sensitivity = 100%
---// If player uses 200%, camera moves 2x faster
---// per input, so aimbot must compensate by
---// halving its speed to match feel
+--// SMOOTHNESS: base lerp alpha (1-100 / 100)
 --//
---// Factor = 100 / Sensitivity
---//   200% sens → factor 0.50 (slower aimbot)
---//   100% sens → factor 1.00 (normal)
---//    50% sens → factor 2.00 (faster aimbot)
+--// DELAY POSITION:
+--//   XSmooth: multiplier on yaw (horizontal) lerp
+--//   YSmooth: multiplier on pitch (vertical) lerp
+--//   JumpSmoothing: reduces speed on airborne targets
 --//
---// ADS factor applies when player is aiming
---// down sights (right click held)
---// =============================================
-local function getSensFactor()
-    local sens = Settings.Sensitivity
-    if sens <= 0 then sens = 1 end
-
-    local adsSens = Settings.ADSSensitivity
-    if adsSens <= 0 then adsSens = 1 end
-
-    -- check if player is ADS (right click held)
-    local isADS = false
-    pcall(function()
-        isADS = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-    end)
-
-    if isADS then
-        return 100 / (sens * (adsSens / 100))
-    else
-        return 100 / sens
-    end
-end
-
---// =============================================
---// [11] MAIN RENDER LOOP
+--// CLOSEST PART: picks nearest body part to crosshair
+--// CLOSEST POSITION: aims at nearest surface point
 --// =============================================
 local renderConnection
 
@@ -364,84 +396,70 @@ renderConnection = RunService.RenderStepped:Connect(function()
         end)
     end
 
-    if not Settings.Enabled then
-        Lock.targetPlayer = nil
-        return
-    end
+    if not Settings.Enabled then return end
     if not CameraController then return end
 
-    if tick() < Lock.cooldownUntil then return end
-
-    local targetPart, targetPlayer, screenDist = getTarget()
-
-    if not targetPart then
-        Lock.targetPlayer = nil
-        return
-    end
-
-    -- target switch
-    if targetPlayer ~= Lock.targetPlayer then
-        Lock.targetPlayer  = targetPlayer
-        Lock.lockStartTick = tick()
-        Lock.switchTick    = tick()
-    end
-
-    -- max lock on check
-    if Settings.MaxLockOn > 0 then
-        if tick() - Lock.lockStartTick > Settings.MaxLockOn then
-            Lock.targetPlayer  = nil
-            Lock.cooldownUntil = tick() + math.max(Settings.ReactionTime / 1000, 0.3)
-            return
-        end
-    end
-
-    -- reaction time check
-    if Settings.ReactionTime > 0 then
-        if (tick() - Lock.switchTick) * 1000 < Settings.ReactionTime then
-            return
-        end
-    end
+    local targetPart = getTarget()
+    if not targetPart then return end
 
     pcall(function()
-        local camPos  = Camera.CFrame.Position
-        local dirUnit = (targetPart.Position - camPos).Unit
+        local camPos = Camera.CFrame.Position
 
+        -- get aim position
+        -- either closest surface point or part center
+        local aimPos
+        if Settings.ClosestPosition then
+            aimPos = getClosestPointOnPart(targetPart)
+        else
+            aimPos = targetPart.Position
+        end
+
+        local dirUnit = (aimPos - camPos).Unit
+
+        -- target angles
         local targetPitch = math.asin(dirUnit.Y)
         local targetYaw   = math.atan2(-dirUnit.X, -dirUnit.Z)
 
-        -- KICIAHOOK SPEED CALCULATION
-        local currentSpeed = Settings.Speed
-        if isAttacking() then
-            currentSpeed = Settings.SpeedInAttack
+        -- base smoothness alpha
+        local baseAlpha = Settings.Smoothness / 100
+
+        -- DELAY POSITION: separate X and Y multipliers
+        -- XSmooth at 100% = full base speed horizontal
+        -- XSmooth at 50% = half speed horizontal
+        -- same for YSmooth on vertical axis
+        local xFactor = Settings.XSmooth / 100
+        local yFactor = Settings.YSmooth / 100
+
+        local yawAlpha   = baseAlpha * xFactor
+        local pitchAlpha = baseAlpha * yFactor
+
+        -- JUMP SMOOTHING: reduce speed on airborne targets
+        -- JumpSmoothing at 100% = full speed (no reduction)
+        -- JumpSmoothing at 50% = half speed on jumping targets
+        -- JumpSmoothing at 1% = almost no tracking on jumpers
+        if isAirborne(targetPart.Parent) then
+            local jumpFactor = Settings.JumpSmoothing / 100
+            yawAlpha   = yawAlpha   * jumpFactor
+            pitchAlpha = pitchAlpha * jumpFactor
         end
 
-        local alpha = currentSpeed / 5
+        -- clamp
+        yawAlpha   = math.clamp(yawAlpha, 0, 1)
+        pitchAlpha = math.clamp(pitchAlpha, 0, 1)
 
-        -- SpeedScale-FOV
-        if Settings.SpeedScaleFOV > 0 and Settings.FOVRadius > 0 then
-            local closeness = 1 - math.clamp(screenDist / Settings.FOVRadius, 0, 1)
-            local fovFactor = 1 + closeness * (Settings.SpeedScaleFOV / 100)
-            alpha = alpha * fovFactor
-        end
+        -- get current rotation
+        local current = CameraController.Rotation
 
-        -- SENSITIVITY COMPENSATION
-        -- adjust alpha so aimbot feels the same
-        -- regardless of player sensitivity setting
-        alpha = alpha * getSensFactor()
-
-        alpha = math.clamp(alpha, 0, 1)
-
-        -- apply rotation
-        local current  = CameraController.Rotation
-        local newPitch = current.X + (targetPitch - current.X) * alpha
-        local newYaw   = current.Y + angleDiff(current.Y, targetYaw) * alpha
+        -- lerp each axis independently
+        local newPitch = current.X + (targetPitch - current.X) * pitchAlpha
+        local newYaw   = current.Y + angleDiff(current.Y, targetYaw) * yawAlpha
 
         CameraController:SetRotation(Vector2.new(newPitch, newYaw))
     end)
 end)
 
 --// =============================================
---// [12] UI COLORS
+--// [14] UI COLORS
 --// =============================================
 local C = {
     bg          = Color3.fromRGB(14, 14, 24),
@@ -470,7 +488,7 @@ local C = {
 }
 
 --// =============================================
---// [13] SCREENGUI
+--// [15] SCREENGUI
 --// =============================================
 pcall(function()
     local old = CoreGui:FindFirstChild("RivalsAimbotGui")
@@ -478,10 +496,8 @@ pcall(function()
 end)
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name           = "RivalsAimbotGui"
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.ResetOnSpawn   = false
-screenGui.DisplayOrder   = 100
+screenGui.Name = "RivalsAimbotGui"; screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.ResetOnSpawn = false; screenGui.DisplayOrder = 100
 
 pcall(function()
     if syn and syn.protect_gui then syn.protect_gui(screenGui)
@@ -491,46 +507,30 @@ end)
 screenGui.Parent = CoreGui
 
 --// =============================================
---// [14] MAIN WINDOW
+--// [16] MAIN WINDOW + FLOATING BUTTON
 --// =============================================
 local mainFrame = Instance.new("Frame")
-mainFrame.Name             = "MainWindow"
-mainFrame.Size             = UDim2.new(0, 270, 0, 520)
-mainFrame.Position         = UDim2.new(0.5, -135, 0.04, 0)
-mainFrame.BackgroundColor3 = C.bg
-mainFrame.BorderSizePixel  = 0
-mainFrame.Visible          = not SILENT_LOAD
-mainFrame.Parent           = screenGui
+mainFrame.Name = "MainWindow"; mainFrame.Size = UDim2.new(0, 270, 0, 520)
+mainFrame.Position = UDim2.new(0.5, -135, 0.04, 0)
+mainFrame.BackgroundColor3 = C.bg; mainFrame.BorderSizePixel = 0
+mainFrame.Visible = not SILENT_LOAD; mainFrame.Parent = screenGui
 
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 14)
 
-local mainStroke = Instance.new("UIStroke")
-mainStroke.Color = C.accentDim; mainStroke.Thickness = 1.5
-mainStroke.Transparency = 0.3; mainStroke.Parent = mainFrame
+local mStroke = Instance.new("UIStroke"); mStroke.Color = C.accentDim
+mStroke.Thickness = 1.5; mStroke.Transparency = 0.3; mStroke.Parent = mainFrame
 
---// =============================================
---// [15] FLOATING BUTTON
---// =============================================
+-- floating button
 local floatBtn = Instance.new("TextButton")
-floatBtn.Name             = "FloatToggle"
-floatBtn.Size             = UDim2.new(0, 46, 0, 46)
-floatBtn.Position         = UDim2.new(0, 14, 0.45, 0)
-floatBtn.BackgroundColor3 = C.floatBtn
-floatBtn.Text             = SILENT_LOAD and "⚡" or "✕"
-floatBtn.TextColor3       = Color3.new(1,1,1)
-floatBtn.TextSize         = 20
-floatBtn.Font             = Enum.Font.GothamBold
-floatBtn.BorderSizePixel  = 0
-floatBtn.AutoButtonColor  = false
-floatBtn.ZIndex           = 10
-floatBtn.Parent           = screenGui
+floatBtn.Size = UDim2.new(0, 46, 0, 46); floatBtn.Position = UDim2.new(0, 14, 0.45, 0)
+floatBtn.BackgroundColor3 = C.floatBtn; floatBtn.Text = SILENT_LOAD and "⚡" or "✕"
+floatBtn.TextColor3 = Color3.new(1,1,1); floatBtn.TextSize = 20
+floatBtn.Font = Enum.Font.GothamBold; floatBtn.BorderSizePixel = 0
+floatBtn.AutoButtonColor = false; floatBtn.ZIndex = 10; floatBtn.Parent = screenGui
 
 Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 23)
-
-local fStr = Instance.new("UIStroke"); fStr.Color = C.accentGlow
-fStr.Thickness = 2; fStr.Parent = floatBtn
-local fGlw = Instance.new("UIStroke"); fGlw.Color = C.accentGlow
-fGlw.Thickness = 4; fGlw.Transparency = 0.7; fGlw.Parent = floatBtn
+local fs1 = Instance.new("UIStroke"); fs1.Color = C.accentGlow; fs1.Thickness = 2; fs1.Parent = floatBtn
+local fs2 = Instance.new("UIStroke"); fs2.Color = C.accentGlow; fs2.Thickness = 4; fs2.Transparency = 0.7; fs2.Parent = floatBtn
 
 floatBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = not mainFrame.Visible
@@ -542,311 +542,203 @@ floatBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
-local floatDragging  = false
-local floatDragStart = Vector2.zero
-local floatStartPos  = UDim2.new()
-
+local floatDragging, floatDragStart, floatStartPos = false, Vector2.zero, UDim2.new()
 floatBtn.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.Touch
-    or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        floatDragging  = true
-        floatDragStart = Vector2.new(input.Position.X, input.Position.Y)
-        floatStartPos  = floatBtn.Position
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        floatDragging = true; floatDragStart = Vector2.new(input.Position.X, input.Position.Y); floatStartPos = floatBtn.Position
     end
 end)
 
 --// =============================================
---// [16] TITLE BAR
+--// [17] TITLE BAR
 --// =============================================
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 44); titleBar.BackgroundColor3 = C.surface
-titleBar.BorderSizePixel = 0; titleBar.ZIndex = 5; titleBar.Parent = mainFrame
-
+local titleBar = Instance.new("Frame"); titleBar.Size = UDim2.new(1, 0, 0, 44)
+titleBar.BackgroundColor3 = C.surface; titleBar.BorderSizePixel = 0; titleBar.ZIndex = 5; titleBar.Parent = mainFrame
 Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 14)
 
-local tbFix = Instance.new("Frame"); tbFix.Size = UDim2.new(1, 0, 0, 14)
-tbFix.Position = UDim2.new(0, 0, 1, -14); tbFix.BackgroundColor3 = C.surface
-tbFix.BorderSizePixel = 0; tbFix.ZIndex = 5; tbFix.Parent = titleBar
+local tbFix = Instance.new("Frame"); tbFix.Size = UDim2.new(1, 0, 0, 14); tbFix.Position = UDim2.new(0, 0, 1, -14)
+tbFix.BackgroundColor3 = C.surface; tbFix.BorderSizePixel = 0; tbFix.ZIndex = 5; tbFix.Parent = titleBar
 
-local aLine = Instance.new("Frame"); aLine.Size = UDim2.new(1, -24, 0, 2)
-aLine.Position = UDim2.new(0, 12, 1, 0); aLine.BackgroundColor3 = C.accent
-aLine.BorderSizePixel = 0; aLine.ZIndex = 6; aLine.Parent = titleBar
+local aLine = Instance.new("Frame"); aLine.Size = UDim2.new(1, -24, 0, 2); aLine.Position = UDim2.new(0, 12, 1, 0)
+aLine.BackgroundColor3 = C.accent; aLine.BorderSizePixel = 0; aLine.ZIndex = 6; aLine.Parent = titleBar
 
-local tLbl = Instance.new("TextLabel"); tLbl.Size = UDim2.new(1, -56, 1, 0)
-tLbl.Position = UDim2.new(0, 16, 0, 0); tLbl.BackgroundTransparency = 1
-tLbl.Text = "⚡ Rivals Aimbot"; tLbl.TextColor3 = C.text; tLbl.TextSize = 15
-tLbl.Font = Enum.Font.GothamBold; tLbl.TextXAlignment = Enum.TextXAlignment.Left
-tLbl.ZIndex = 6; tLbl.Parent = titleBar
+local tLbl = Instance.new("TextLabel"); tLbl.Size = UDim2.new(1, -56, 1, 0); tLbl.Position = UDim2.new(0, 16, 0, 0)
+tLbl.BackgroundTransparency = 1; tLbl.Text = "⚡ Rivals Aimbot"; tLbl.TextColor3 = C.text; tLbl.TextSize = 15
+tLbl.Font = Enum.Font.GothamBold; tLbl.TextXAlignment = Enum.TextXAlignment.Left; tLbl.ZIndex = 6; tLbl.Parent = titleBar
 
-local closeBtn = Instance.new("TextButton"); closeBtn.Size = UDim2.new(0, 28, 0, 28)
-closeBtn.Position = UDim2.new(1, -36, 0, 8); closeBtn.BackgroundColor3 = C.danger
-closeBtn.Text = "—"; closeBtn.TextColor3 = Color3.new(1,1,1); closeBtn.TextSize = 16
-closeBtn.Font = Enum.Font.GothamBold; closeBtn.BorderSizePixel = 0
-closeBtn.ZIndex = 7; closeBtn.Parent = titleBar
-
+local closeBtn = Instance.new("TextButton"); closeBtn.Size = UDim2.new(0, 28, 0, 28); closeBtn.Position = UDim2.new(1, -36, 0, 8)
+closeBtn.BackgroundColor3 = C.danger; closeBtn.Text = "—"; closeBtn.TextColor3 = Color3.new(1,1,1)
+closeBtn.TextSize = 16; closeBtn.Font = Enum.Font.GothamBold; closeBtn.BorderSizePixel = 0; closeBtn.ZIndex = 7; closeBtn.Parent = titleBar
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
 
-closeBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = false; floatBtn.Text = "⚡"
-end)
+closeBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false; floatBtn.Text = "⚡" end)
 
 --// =============================================
---// [17] SCROLL CONTENT
+--// [18] SCROLL CONTENT
 --// =============================================
-local content = Instance.new("ScrollingFrame")
-content.Size = UDim2.new(1, 0, 1, -50); content.Position = UDim2.new(0, 0, 0, 50)
-content.BackgroundTransparency = 1; content.BorderSizePixel = 0
-content.ScrollBarThickness = 3; content.ScrollBarImageColor3 = C.accent
-content.ScrollBarImageTransparency = 0.5; content.CanvasSize = UDim2.new(0,0,0,0)
-content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+local content = Instance.new("ScrollingFrame"); content.Size = UDim2.new(1, 0, 1, -50); content.Position = UDim2.new(0, 0, 0, 50)
+content.BackgroundTransparency = 1; content.BorderSizePixel = 0; content.ScrollBarThickness = 3
+content.ScrollBarImageColor3 = C.accent; content.ScrollBarImageTransparency = 0.5
+content.CanvasSize = UDim2.new(0,0,0,0); content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 content.ScrollingDirection = Enum.ScrollingDirection.Y; content.Parent = mainFrame
 
-local cLayout = Instance.new("UIListLayout"); cLayout.SortOrder = Enum.SortOrder.LayoutOrder
-cLayout.Padding = UDim.new(0, 4); cLayout.Parent = content
-
-local cPad = Instance.new("UIPadding"); cPad.PaddingTop = UDim.new(0, 6)
-cPad.PaddingBottom = UDim.new(0, 14); cPad.PaddingLeft = UDim.new(0, 10)
-cPad.PaddingRight = UDim.new(0, 10); cPad.Parent = content
+Instance.new("UIListLayout", content).SortOrder = Enum.SortOrder.LayoutOrder; content:FindFirstChildOfClass("UIListLayout").Padding = UDim.new(0, 4)
+local cPad = Instance.new("UIPadding"); cPad.PaddingTop = UDim.new(0, 6); cPad.PaddingBottom = UDim.new(0, 14)
+cPad.PaddingLeft = UDim.new(0, 10); cPad.PaddingRight = UDim.new(0, 10); cPad.Parent = content
 
 --// =============================================
---// [18] GLOBAL INPUT HANDLER
+--// [19] GLOBAL INPUT
 --// =============================================
-local windowDragging  = false
-local windowDragStart = Vector2.zero
-local windowStartPos  = UDim2.new()
-local activeSlider    = nil
+local windowDragging, windowDragStart, windowStartPos = false, Vector2.zero, UDim2.new()
+local activeSlider = nil
 
 titleBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.Touch
-    or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        windowDragging  = true
-        windowDragStart = Vector2.new(input.Position.X, input.Position.Y)
-        windowStartPos  = mainFrame.Position
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        windowDragging = true; windowDragStart = Vector2.new(input.Position.X, input.Position.Y); windowStartPos = mainFrame.Position
     end
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-    if input.UserInputType ~= Enum.UserInputType.Touch
-    and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-
+    if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
     if windowDragging then
         local d = Vector2.new(input.Position.X, input.Position.Y) - windowDragStart
-        mainFrame.Position = UDim2.new(
-            windowStartPos.X.Scale, windowStartPos.X.Offset + d.X,
-            windowStartPos.Y.Scale, windowStartPos.Y.Offset + d.Y
-        )
+        mainFrame.Position = UDim2.new(windowStartPos.X.Scale, windowStartPos.X.Offset + d.X, windowStartPos.Y.Scale, windowStartPos.Y.Offset + d.Y)
     end
-
     if floatDragging then
         local d = Vector2.new(input.Position.X, input.Position.Y) - floatDragStart
-        floatBtn.Position = UDim2.new(
-            floatStartPos.X.Scale, floatStartPos.X.Offset + d.X,
-            floatStartPos.Y.Scale, floatStartPos.Y.Offset + d.Y
-        )
+        floatBtn.Position = UDim2.new(floatStartPos.X.Scale, floatStartPos.X.Offset + d.X, floatStartPos.Y.Scale, floatStartPos.Y.Offset + d.Y)
     end
-
     if activeSlider then
-        local s   = activeSlider
-        local tX  = s.track.AbsolutePosition.X
-        local tW  = s.track.AbsoluteSize.X
+        local s = activeSlider; local tX = s.track.AbsolutePosition.X; local tW = s.track.AbsoluteSize.X
         local pct = math.clamp((input.Position.X - tX) / tW, 0, 1)
         local val = s.snap(s.min + pct * (s.max - s.min))
         pct = math.clamp((val - s.min) / (s.max - s.min), 0, 1)
-        s.fill.Size      = UDim2.new(pct, 0, 1, 0)
-        s.thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        s.label.Text     = s.name .. ": " .. string.format(s.fmt, val)
-        s.value = val
+        s.fill.Size = UDim2.new(pct, 0, 1, 0); s.thumb.Position = UDim2.new(pct, -9, 0.5, -9)
+        s.label.Text = s.name .. ": " .. string.format(s.fmt, val); s.value = val
         if s.callback then s.callback(val) end
     end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.Touch
-    or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        windowDragging = false
-        floatDragging  = false
-        activeSlider   = nil
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        windowDragging = false; floatDragging = false; activeSlider = nil
     end
 end)
 
 --// =============================================
---// [19] UI COMPONENT BUILDERS
+--// [20] UI BUILDERS
 --// =============================================
 local layoutOrder = 0
 local function nextOrder() layoutOrder = layoutOrder + 1; return layoutOrder end
 
--- all slider references for config reload
 local allSliders = {}
+local allToggles = {}
 
 local function createSection(text)
-    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 26)
-    c.BackgroundTransparency = 1; c.LayoutOrder = nextOrder(); c.Parent = content
-    local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 1, 0)
-    l.Position = UDim2.new(0, 4, 0, 0); l.BackgroundTransparency = 1
-    l.Text = text; l.TextColor3 = C.section; l.TextSize = 11
-    l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Parent = c
+    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 26); c.BackgroundTransparency = 1
+    c.LayoutOrder = nextOrder(); c.Parent = content
+    local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 1, 0); l.Position = UDim2.new(0, 4, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = text; l.TextColor3 = C.section; l.TextSize = 11
+    l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.Parent = c
 end
 
 local function createDivider()
-    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 10)
-    c.BackgroundTransparency = 1; c.LayoutOrder = nextOrder(); c.Parent = content
-    local l = Instance.new("Frame"); l.Size = UDim2.new(1, 0, 0, 1)
-    l.Position = UDim2.new(0, 0, 0.5, 0); l.BackgroundColor3 = C.surfaceHi
-    l.BorderSizePixel = 0; l.Parent = c
+    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 10); c.BackgroundTransparency = 1
+    c.LayoutOrder = nextOrder(); c.Parent = content
+    local l = Instance.new("Frame"); l.Size = UDim2.new(1, 0, 0, 1); l.Position = UDim2.new(0, 0, 0.5, 0)
+    l.BackgroundColor3 = C.surfaceHi; l.BorderSizePixel = 0; l.Parent = c
 end
 
 local function createStatus(text, color)
-    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 22)
-    c.BackgroundTransparency = 1; c.LayoutOrder = nextOrder(); c.Parent = content
-    local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 1, 0)
-    l.Position = UDim2.new(0, 4, 0, 0); l.BackgroundTransparency = 1
-    l.Text = text; l.TextColor3 = color; l.TextSize = 12
-    l.Font = Enum.Font.GothamMedium; l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Parent = c
-    return l
-end
-
--- info paragraph (multi-line text box)
-local function createInfo(text, color)
-    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 0)
-    c.AutomaticSize = Enum.AutomaticSize.Y
-    c.BackgroundColor3 = C.surface; c.BorderSizePixel = 0
+    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 22); c.BackgroundTransparency = 1
     c.LayoutOrder = nextOrder(); c.Parent = content
-    Instance.new("UICorner", c).CornerRadius = UDim.new(0, 8)
-
-    local pad = Instance.new("UIPadding"); pad.PaddingTop = UDim.new(0, 8)
-    pad.PaddingBottom = UDim.new(0, 8); pad.PaddingLeft = UDim.new(0, 10)
-    pad.PaddingRight = UDim.new(0, 10); pad.Parent = c
-
-    local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 0, 0)
-    l.AutomaticSize = Enum.AutomaticSize.Y
-    l.BackgroundTransparency = 1; l.Text = text
-    l.TextColor3 = color or C.textDim; l.TextSize = 11
-    l.Font = Enum.Font.GothamMedium; l.TextXAlignment = Enum.TextXAlignment.Left
-    l.TextWrapped = true; l.Parent = c
-
+    local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 1, 0); l.Position = UDim2.new(0, 4, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = text; l.TextColor3 = color; l.TextSize = 12
+    l.Font = Enum.Font.GothamMedium; l.TextXAlignment = Enum.TextXAlignment.Left; l.Parent = c
     return l
 end
-
-local allToggles = {}
 
 local function createToggle(name, settingKey, default, callback)
-    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 40)
-    row.BackgroundColor3 = C.surface; row.BorderSizePixel = 0
-    row.LayoutOrder = nextOrder(); row.Parent = content
+    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 40); row.BackgroundColor3 = C.surface
+    row.BorderSizePixel = 0; row.LayoutOrder = nextOrder(); row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
 
-    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -70, 1, 0)
-    lbl.Position = UDim2.new(0, 12, 0, 0); lbl.BackgroundTransparency = 1
-    lbl.Text = name; lbl.TextColor3 = C.text; lbl.TextSize = 13
-    lbl.Font = Enum.Font.GothamMedium; lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Parent = row
+    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -70, 1, 0); lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = name; lbl.TextColor3 = C.text; lbl.TextSize = 13
+    lbl.Font = Enum.Font.GothamMedium; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
 
-    local pill = Instance.new("Frame"); pill.Size = UDim2.new(0, 44, 0, 24)
-    pill.Position = UDim2.new(1, -56, 0.5, -12)
-    pill.BackgroundColor3 = default and C.accent or C.toggleOff
-    pill.BorderSizePixel = 0; pill.Parent = row
+    local pill = Instance.new("Frame"); pill.Size = UDim2.new(0, 44, 0, 24); pill.Position = UDim2.new(1, -56, 0.5, -12)
+    pill.BackgroundColor3 = default and C.accent or C.toggleOff; pill.BorderSizePixel = 0; pill.Parent = row
     Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
 
     local knobF = Instance.new("Frame"); knobF.Size = UDim2.new(0, 20, 0, 20)
     knobF.Position = default and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
     knobF.BackgroundColor3 = C.knob; knobF.BorderSizePixel = 0; knobF.Parent = pill
     Instance.new("UICorner", knobF).CornerRadius = UDim.new(1, 0)
-
-    local ks = Instance.new("UIStroke"); ks.Color = Color3.new(0,0,0)
-    ks.Thickness = 1; ks.Transparency = 0.85; ks.Parent = knobF
+    local ks = Instance.new("UIStroke"); ks.Color = Color3.new(0,0,0); ks.Thickness = 1; ks.Transparency = 0.85; ks.Parent = knobF
 
     local state = default
     local tweenI = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
-    local function setVisual(v)
+    local function setVis(v)
         knobF.Position = v and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
         pill.BackgroundColor3 = v and C.accent or C.toggleOff
     end
 
-    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 1, 0)
-    btn.BackgroundTransparency = 1; btn.Text = ""; btn.ZIndex = 2; btn.Parent = row
+    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 1, 0); btn.BackgroundTransparency = 1
+    btn.Text = ""; btn.ZIndex = 2; btn.Parent = row
 
     btn.MouseButton1Click:Connect(function()
         state = not state
-        TweenService:Create(knobF, tweenI, {
-            Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
-        }):Play()
-        TweenService:Create(pill, tweenI, {
-            BackgroundColor3 = state and C.accent or C.toggleOff
-        }):Play()
+        TweenService:Create(knobF, tweenI, { Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2) }):Play()
+        TweenService:Create(pill, tweenI, { BackgroundColor3 = state and C.accent or C.toggleOff }):Play()
         if callback then callback(state) end
     end)
 
-    -- store reference for config reload
     if settingKey then
-        allToggles[settingKey] = {
-            setState = function(v)
-                state = v
-                setVisual(v)
-            end,
-            getState = function() return state end,
-        }
+        allToggles[settingKey] = { setState = function(v) state = v; setVis(v) end, getState = function() return state end }
     end
 end
 
 local function createSlider(name, settingKey, min, max, default, step, callback)
-    step = step or 1
-    local decimals = 0
-    local ss = tostring(step); local dot = ss:find("%.")
+    step = step or 1; local decimals = 0
+    local ss = tostring(step); local dot = ss:find("%%.")
+    if not dot then dot = ss:find("%.") end
     if dot then decimals = #ss - dot end
     local fmt = "%." .. decimals .. "f"
 
     local function snap(raw)
         local v = math.floor(raw / step + 0.5) * step
-        v = math.clamp(v, min, max)
-        return tonumber(string.format(fmt, v))
+        return math.clamp(tonumber(string.format(fmt, v)), min, max)
     end
 
     local initPct = math.clamp((default - min) / (max - min), 0, 1)
-
-    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 52)
-    row.BackgroundColor3 = C.surface; row.BorderSizePixel = 0
-    row.LayoutOrder = nextOrder(); row.Parent = content
+    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 52); row.BackgroundColor3 = C.surface
+    row.BorderSizePixel = 0; row.LayoutOrder = nextOrder(); row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
 
-    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -24, 0, 20)
-    lbl.Position = UDim2.new(0, 12, 0, 4); lbl.BackgroundTransparency = 1
-    lbl.Text = name..": "..string.format(fmt, default); lbl.TextColor3 = C.textDim
-    lbl.TextSize = 12; lbl.Font = Enum.Font.GothamMedium
-    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
+    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -24, 0, 20); lbl.Position = UDim2.new(0, 12, 0, 4)
+    lbl.BackgroundTransparency = 1; lbl.Text = name..": "..string.format(fmt, default); lbl.TextColor3 = C.textDim
+    lbl.TextSize = 12; lbl.Font = Enum.Font.GothamMedium; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
 
-    local track = Instance.new("Frame"); track.Size = UDim2.new(1, -24, 0, 6)
-    track.Position = UDim2.new(0, 12, 0, 32); track.BackgroundColor3 = C.sliderTrack
-    track.BorderSizePixel = 0; track.Parent = row
+    local track = Instance.new("Frame"); track.Size = UDim2.new(1, -24, 0, 6); track.Position = UDim2.new(0, 12, 0, 32)
+    track.BackgroundColor3 = C.sliderTrack; track.BorderSizePixel = 0; track.Parent = row
     Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
-    local fill = Instance.new("Frame"); fill.Size = UDim2.new(initPct, 0, 1, 0)
-    fill.BackgroundColor3 = C.accent; fill.BorderSizePixel = 0; fill.Parent = track
-    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+    local fill = Instance.new("Frame"); fill.Size = UDim2.new(initPct, 0, 1, 0); fill.BackgroundColor3 = C.accent
+    fill.BorderSizePixel = 0; fill.Parent = track; Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
 
-    local thumb = Instance.new("Frame"); thumb.Size = UDim2.new(0, 18, 0, 18)
-    thumb.Position = UDim2.new(initPct, -9, 0.5, -9); thumb.BackgroundColor3 = C.knob
-    thumb.BorderSizePixel = 0; thumb.ZIndex = 3; thumb.Parent = track
+    local thumb = Instance.new("Frame"); thumb.Size = UDim2.new(0, 18, 0, 18); thumb.Position = UDim2.new(initPct, -9, 0.5, -9)
+    thumb.BackgroundColor3 = C.knob; thumb.BorderSizePixel = 0; thumb.ZIndex = 3; thumb.Parent = track
     Instance.new("UICorner", thumb).CornerRadius = UDim.new(1, 0)
-
     local ts = Instance.new("UIStroke"); ts.Color = C.accent; ts.Thickness = 2; ts.Parent = thumb
 
-    local data = {
-        track = track, fill = fill, thumb = thumb, label = lbl,
-        name = name, min = min, max = max, snap = snap, fmt = fmt,
-        value = default, callback = callback, settingKey = settingKey,
-    }
+    local data = { track=track, fill=fill, thumb=thumb, label=lbl, name=name, min=min, max=max, snap=snap, fmt=fmt, value=default, callback=callback }
 
-    -- method to update visual from code (config load)
     function data:setValueFromCode(val)
-        val = snap(val)
-        local pct = math.clamp((val - min) / (max - min), 0, 1)
-        fill.Size      = UDim2.new(pct, 0, 1, 0)
-        thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        lbl.Text       = name .. ": " .. string.format(fmt, val)
-        data.value     = val
+        val = snap(val); local pct = math.clamp((val - min) / (max - min), 0, 1)
+        fill.Size = UDim2.new(pct, 0, 1, 0); thumb.Position = UDim2.new(pct, -9, 0.5, -9)
+        lbl.Text = name..": "..string.format(fmt, val); data.value = val
         if callback then callback(val) end
     end
 
@@ -854,308 +746,138 @@ local function createSlider(name, settingKey, min, max, default, step, callback)
     touchArea.Position = UDim2.new(0, -6, 0.5, -17); touchArea.BackgroundTransparency = 1
     touchArea.Text = ""; touchArea.ZIndex = 4; touchArea.Parent = track
 
-    local function beginSlide(input)
-        activeSlider = data
-        local tX = track.AbsolutePosition.X; local tW = track.AbsoluteSize.X
-        local pct = math.clamp((input.Position.X - tX) / tW, 0, 1)
-        local val = snap(min + pct * (max - min))
-        pct = math.clamp((val - min) / (max - min), 0, 1)
-        fill.Size = UDim2.new(pct, 0, 1, 0); thumb.Position = UDim2.new(pct, -9, 0.5, -9)
-        lbl.Text = name..": "..string.format(fmt, val); data.value = val
-        if callback then callback(val) end
-    end
-
     touchArea.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-        or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            beginSlide(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            activeSlider = data
+            local tX = track.AbsolutePosition.X; local tW = track.AbsoluteSize.X
+            local pct = math.clamp((input.Position.X - tX) / tW, 0, 1)
+            local val = snap(min + pct * (max - min)); pct = math.clamp((val - min) / (max - min), 0, 1)
+            fill.Size = UDim2.new(pct, 0, 1, 0); thumb.Position = UDim2.new(pct, -9, 0.5, -9)
+            lbl.Text = name..": "..string.format(fmt, val); data.value = val
+            if callback then callback(val) end
         end
     end)
 
-    if settingKey then
-        allSliders[settingKey] = data
-    end
-
+    if settingKey then allSliders[settingKey] = data end
     return data
 end
 
--- small button
-local function createButton(text, color, callback)
-    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 0, 34)
-    btn.BackgroundColor3 = color; btn.Text = text
-    btn.TextColor3 = Color3.new(1,1,1); btn.TextSize = 13
-    btn.Font = Enum.Font.GothamBold; btn.BorderSizePixel = 0
-    btn.LayoutOrder = nextOrder(); btn.Parent = content
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
-    btn.MouseButton1Click:Connect(function()
-        if callback then callback() end
-    end)
-    return btn
-end
-
--- text input
 local function createInput(placeholder)
-    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 38)
-    row.BackgroundColor3 = C.inputBg; row.BorderSizePixel = 0
-    row.LayoutOrder = nextOrder(); row.Parent = content
+    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 38); row.BackgroundColor3 = C.inputBg
+    row.BorderSizePixel = 0; row.LayoutOrder = nextOrder(); row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+    local st = Instance.new("UIStroke"); st.Color = C.inputBorder; st.Thickness = 1.5; st.Parent = row
 
-    local stroke = Instance.new("UIStroke"); stroke.Color = C.inputBorder
-    stroke.Thickness = 1.5; stroke.Parent = row
-
-    local box = Instance.new("TextBox"); box.Size = UDim2.new(1, -16, 1, 0)
-    box.Position = UDim2.new(0, 8, 0, 0); box.BackgroundTransparency = 1
-    box.Text = ""; box.PlaceholderText = placeholder
-    box.PlaceholderColor3 = C.textDim; box.TextColor3 = C.text
-    box.TextSize = 13; box.Font = Enum.Font.GothamMedium
-    box.TextXAlignment = Enum.TextXAlignment.Left
-    box.ClearTextOnFocus = false
-    box.Parent = row
-
+    local box = Instance.new("TextBox"); box.Size = UDim2.new(1, -16, 1, 0); box.Position = UDim2.new(0, 8, 0, 0)
+    box.BackgroundTransparency = 1; box.Text = ""; box.PlaceholderText = placeholder
+    box.PlaceholderColor3 = C.textDim; box.TextColor3 = C.text; box.TextSize = 13
+    box.Font = Enum.Font.GothamMedium; box.TextXAlignment = Enum.TextXAlignment.Left
+    box.ClearTextOnFocus = false; box.Parent = row
     return box
 end
 
---// =============================================
---// [20] REFRESH UI FROM SETTINGS
---// called after config load to sync all sliders
---// and toggles with loaded values
---// =============================================
-local configStatusLabel = nil
-
-local function refreshUIFromSettings()
-    -- update sliders
+local function refreshUI()
     for key, slider in pairs(allSliders) do
-        if Settings[key] ~= nil then
-            slider:setValueFromCode(Settings[key])
-        end
+        if Settings[key] ~= nil then slider:setValueFromCode(Settings[key]) end
     end
-
-    -- update toggles
     for key, toggle in pairs(allToggles) do
-        if Settings[key] ~= nil then
-            toggle.setState(Settings[key])
-        end
+        if Settings[key] ~= nil then toggle.setState(Settings[key]) end
     end
 end
 
 --// =============================================
---// [21] BUILD ALL UI ELEMENTS
+--// [21] BUILD UI
 --// =============================================
 
--- status
-if CameraController then
-    createStatus("✓ CameraController connected", C.success)
-else
-    createStatus("✗ CameraController not found", C.warning)
-end
-if SILENT_LOAD then createStatus("🔇 Silent Load active", C.textDim) end
-if AUTO_LOAD then createStatus("⚡ Auto Load — aimbot ON", C.accentGlow) end
+if CameraController then createStatus("✓ CameraController connected", C.success)
+else createStatus("✗ CameraController not found", C.warning) end
+if SILENT_LOAD then createStatus("🔇 Silent Load", C.textDim) end
+if AUTO_LOAD then createStatus("⚡ Auto Load ON", C.accentGlow) end
 
 createDivider()
-
--- ——— TARGETING ———
 createSection("TARGETING")
 
-createToggle("Aimbot", "Enabled", AUTO_LOAD, function(v)
-    Settings.Enabled = v
-    if not v then Lock.targetPlayer = nil end
-end)
-
-createToggle("Aim At Head", "AimHead", true, function(v)
-    Settings.AimHead = v
-end)
-
-createToggle("Show FOV", "ShowFOV", false, function(v)
-    Settings.ShowFOV = v
-end)
-
-createSlider("FOV Radius", "FOVRadius", 10, 500, 150, 1, function(v)
-    Settings.FOVRadius = v
-end)
+createToggle("Aimbot", "Enabled", AUTO_LOAD, function(v) Settings.Enabled = v end)
+createToggle("Aim At Head", "AimHead", true, function(v) Settings.AimHead = v end)
+createToggle("Show FOV", "ShowFOV", false, function(v) Settings.ShowFOV = v end)
+createSlider("FOV Radius", "FOVRadius", 10, 500, 150, 1, function(v) Settings.FOVRadius = v end)
+createSlider("Smoothness", "Smoothness", 1, 100, 15, 1, function(v) Settings.Smoothness = v end)
 
 createDivider()
-
--- ——— CHECKS ———
 createSection("CHECKS")
 
-createToggle("Team Check", "TeamCheck", false, function(v)
-    Settings.TeamCheck = v
-end)
-
-createToggle("Visible Check", "VisibleCheck", false, function(v)
-    Settings.VisibleCheck = v
-end)
+createToggle("Team Check", "TeamCheck", false, function(v) Settings.TeamCheck = v end)
+createToggle("Visible Check", "VisibleCheck", false, function(v) Settings.VisibleCheck = v end)
 
 createDivider()
+createSection("DELAY POSITION")
 
--- ——— AIM SPEED ———
-createSection("AIM SPEED")
-
-createSlider("Speed", "Speed", 0, 5, 1.50, 0.05, function(v)
-    Settings.Speed = v
-end)
-
-createSlider("Speed In Attack", "SpeedInAttack", 0, 5, 2.50, 0.05, function(v)
-    Settings.SpeedInAttack = v
-end)
-
-createSlider("SpeedScale-FOV", "SpeedScaleFOV", 0, 100, 50, 1, function(v)
-    Settings.SpeedScaleFOV = v
-end)
+createSlider("X Smooth", "XSmooth", 1, 100, 100, 1, function(v) Settings.XSmooth = v end)
+createSlider("Y Smooth", "YSmooth", 1, 100, 100, 1, function(v) Settings.YSmooth = v end)
+createSlider("Jump Smoothing", "JumpSmoothing", 1, 100, 50, 1, function(v) Settings.JumpSmoothing = v end)
 
 createDivider()
+createSection("ADVANCED TARGETING")
 
--- ——— LOCK CONTROL ———
-createSection("LOCK CONTROL")
-
-createSlider("Max Lock On", "MaxLockOn", 0, 10, 0, 1, function(v)
-    Settings.MaxLockOn = v
-end)
-
-createSlider("Reaction Time", "ReactionTime", 0, 500, 0, 1, function(v)
-    Settings.ReactionTime = v
-end)
+createToggle("Closest Part", "ClosestPart", false, function(v) Settings.ClosestPart = v end)
+createToggle("Closest Position", "ClosestPosition", false, function(v) Settings.ClosestPosition = v end)
 
 createDivider()
-
--- ——— SENSITIVITY MATCHING ———
-createSection("SENSITIVITY MATCH")
-
-createInfo(
-    "⚠️ Match these to your Rivals settings!\n\n"
-    .. "Open Rivals → Settings → Controls\n"
-    .. "Copy your Sensitivity and ADS Sensitivity\n"
-    .. "Set the same values below.\n\n"
-    .. "This ensures the aimbot speed feels\n"
-    .. "correct at ANY sensitivity.",
-    C.info
-)
-
-createSlider("Sensitivity", "Sensitivity", 0, 400, 100, 1, function(v)
-    Settings.Sensitivity = v
-end)
-
-createSlider("ADS Sensitivity", "ADSSensitivity", 0, 200, 100, 1, function(v)
-    Settings.ADSSensitivity = v
-end)
-
-createInfo(
-    "💡 Recommended Rivals settings:\n"
-    .. "• Sensitivity: 80-120%\n"
-    .. "• ADS Sensitivity: 60-80%\n\n"
-    .. "Lower sens = more precise aim\n"
-    .. "Higher sens = faster camera turn",
-    C.textDim
-)
-
-createDivider()
-
--- ——— CONFIG SAVE / LOAD ———
 createSection("CONFIG")
 
-configStatusLabel = createStatus("", C.textDim)
+local configStatusLabel = createStatus("", C.textDim)
+local configInput = createInput("Config name...")
 
-local configNameInput = createInput("Config name...")
-
--- button row container
 local btnRow = Instance.new("Frame"); btnRow.Size = UDim2.new(1, 0, 0, 34)
-btnRow.BackgroundTransparency = 1; btnRow.LayoutOrder = nextOrder()
-btnRow.Parent = content
+btnRow.BackgroundTransparency = 1; btnRow.LayoutOrder = nextOrder(); btnRow.Parent = content
 
--- save button
-local saveBtn = Instance.new("TextButton"); saveBtn.Size = UDim2.new(0.48, 0, 1, 0)
-saveBtn.Position = UDim2.new(0, 0, 0, 0); saveBtn.BackgroundColor3 = C.btnGreen
-saveBtn.Text = "💾 Save"; saveBtn.TextColor3 = Color3.new(1,1,1)
-saveBtn.TextSize = 13; saveBtn.Font = Enum.Font.GothamBold
-saveBtn.BorderSizePixel = 0; saveBtn.Parent = btnRow
-Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 8)
+local saveB = Instance.new("TextButton"); saveB.Size = UDim2.new(0.48, 0, 1, 0)
+saveB.BackgroundColor3 = C.btnGreen; saveB.Text = "💾 Save"; saveB.TextColor3 = Color3.new(1,1,1)
+saveB.TextSize = 13; saveB.Font = Enum.Font.GothamBold; saveB.BorderSizePixel = 0; saveB.Parent = btnRow
+Instance.new("UICorner", saveB).CornerRadius = UDim.new(0, 8)
 
--- load button
-local loadBtn = Instance.new("TextButton"); loadBtn.Size = UDim2.new(0.48, 0, 1, 0)
-loadBtn.Position = UDim2.new(0.52, 0, 0, 0); loadBtn.BackgroundColor3 = C.btnBlue
-loadBtn.Text = "📂 Load"; loadBtn.TextColor3 = Color3.new(1,1,1)
-loadBtn.TextSize = 13; loadBtn.Font = Enum.Font.GothamBold
-loadBtn.BorderSizePixel = 0; loadBtn.Parent = btnRow
-Instance.new("UICorner", loadBtn).CornerRadius = UDim.new(0, 8)
+local loadB = Instance.new("TextButton"); loadB.Size = UDim2.new(0.48, 0, 1, 0); loadB.Position = UDim2.new(0.52, 0, 0, 0)
+loadB.BackgroundColor3 = C.btnBlue; loadB.Text = "📂 Load"; loadB.TextColor3 = Color3.new(1,1,1)
+loadB.TextSize = 13; loadB.Font = Enum.Font.GothamBold; loadB.BorderSizePixel = 0; loadB.Parent = btnRow
+Instance.new("UICorner", loadB).CornerRadius = UDim.new(0, 8)
 
--- delete button
-local delBtn = Instance.new("TextButton"); delBtn.Size = UDim2.new(1, 0, 0, 30)
-delBtn.BackgroundColor3 = C.btnRed; delBtn.Text = "🗑️ Delete Config"
-delBtn.TextColor3 = Color3.new(1,1,1); delBtn.TextSize = 12
-delBtn.Font = Enum.Font.GothamBold; delBtn.BorderSizePixel = 0
-delBtn.LayoutOrder = nextOrder(); delBtn.Parent = content
-Instance.new("UICorner", delBtn).CornerRadius = UDim.new(0, 8)
+local delB = Instance.new("TextButton"); delB.Size = UDim2.new(1, 0, 0, 30)
+delB.BackgroundColor3 = C.btnRed; delB.Text = "🗑️ Delete"; delB.TextColor3 = Color3.new(1,1,1)
+delB.TextSize = 12; delB.Font = Enum.Font.GothamBold; delB.BorderSizePixel = 0
+delB.LayoutOrder = nextOrder(); delB.Parent = content
+Instance.new("UICorner", delB).CornerRadius = UDim.new(0, 8)
 
--- list configs label
-local configListLabel = createStatus("Saved configs: loading...", C.textDim)
+local configListLabel = createStatus("Saved: loading...", C.textDim)
 
-local function updateConfigList()
-    local list = getConfigList()
-    if #list == 0 then
-        configListLabel.Text = "Saved configs: none"
-    else
-        configListLabel.Text = "Saved configs: " .. table.concat(list, ", ")
-    end
+local function updateList()
+    local l = getConfigList()
+    configListLabel.Text = #l == 0 and "Saved: none" or "Saved: " .. table.concat(l, ", ")
 end
+updateList()
 
-updateConfigList()
+local function flash(t, c) if configStatusLabel then configStatusLabel.Text = t; configStatusLabel.TextColor3 = c end end
 
-local function flashStatus(text, color)
-    if configStatusLabel then
-        configStatusLabel.Text = text
-        configStatusLabel.TextColor3 = color
-    end
-end
-
--- SAVE
-saveBtn.MouseButton1Click:Connect(function()
-    local name = configNameInput.Text
-    if name == "" then
-        flashStatus("❌ Enter a config name first", C.danger)
-        return
-    end
-
-    local ok, err = saveConfig(name)
-    if ok then
-        flashStatus("✅ Saved: " .. name, C.success)
-        updateConfigList()
-    else
-        flashStatus("❌ Save failed: " .. tostring(err), C.danger)
-    end
+saveB.MouseButton1Click:Connect(function()
+    local n = configInput.Text
+    if n == "" then flash("❌ Enter a name", C.danger); return end
+    local ok = saveConfig(n)
+    flash(ok and "✅ Saved: "..n or "❌ Save failed", ok and C.success or C.danger)
+    updateList()
 end)
 
--- LOAD
-loadBtn.MouseButton1Click:Connect(function()
-    local name = configNameInput.Text
-    if name == "" then
-        flashStatus("❌ Enter config name to load", C.danger)
-        return
-    end
-
-    local ok, err = loadConfig(name)
-    if ok then
-        refreshUIFromSettings()
-        flashStatus("✅ Loaded: " .. name, C.success)
-    else
-        flashStatus("❌ Load failed: " .. tostring(err), C.danger)
-    end
+loadB.MouseButton1Click:Connect(function()
+    local n = configInput.Text
+    if n == "" then flash("❌ Enter name to load", C.danger); return end
+    local ok = loadConfig(n)
+    if ok then refreshUI(); flash("✅ Loaded: "..n, C.success) else flash("❌ Not found", C.danger) end
 end)
 
--- DELETE
-delBtn.MouseButton1Click:Connect(function()
-    local name = configNameInput.Text
-    if name == "" then
-        flashStatus("❌ Enter config name to delete", C.danger)
-        return
-    end
-
-    local ok = deleteConfig(name)
-    if ok then
-        flashStatus("🗑️ Deleted: " .. name, C.warning)
-        updateConfigList()
-    else
-        flashStatus("❌ Delete failed", C.danger)
-    end
+delB.MouseButton1Click:Connect(function()
+    local n = configInput.Text
+    if n == "" then flash("❌ Enter name to delete", C.danger); return end
+    local ok = deleteConfig(n)
+    flash(ok and "🗑️ Deleted: "..n or "❌ Failed", ok and C.warning or C.danger)
+    updateList()
 end)
 
 --// =============================================
@@ -1163,9 +885,7 @@ end)
 --// =============================================
 local function fullCleanup()
     pcall(function() renderConnection:Disconnect() end)
-    pcall(function()
-        if fovCircle then fovCircle.Visible = false; fovCircle:Remove(); fovCircle = nil end
-    end)
+    pcall(function() if fovCircle then fovCircle.Visible = false; fovCircle:Remove(); fovCircle = nil end end)
     pcall(function() screenGui:Destroy() end)
     getgenv().RivalsAimbotCleanup = nil
 end
