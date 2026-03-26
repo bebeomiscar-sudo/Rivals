@@ -1,7 +1,8 @@
 --// =============================================
---// RIVALS MOBILE AIMBOT
+--// RIVALS MOBILE AIMBOT + SILENT AIM
 --// Smoothness · Delay Position (X/Y/Jump Smooth)
 --// Closest Part · Closest Position
+--// Silent Aim (Remote Hook)
 --// Config Save/Load · Team/Visible Check
 --// Silent Load · Floating Button
 --// Pure Instance UI · Rivals CameraController
@@ -29,6 +30,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService     = game:GetService("TweenService")
 local CoreGui          = game:GetService("CoreGui")
 local HttpService      = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
@@ -84,6 +86,31 @@ if not CameraController then
 end
 
 --// =============================================
+--// [4.5] SILENT AIM REMOTE & UTILITY          [NEW]
+--// get the exact remote Rivals uses to send
+--// camera rotation to the server, and the
+--// Utility module that encodes the rotation
+--// =============================================
+local UpdateCameraRotation = nil
+local UtilityModule        = nil
+
+pcall(function()
+    UpdateCameraRotation = ReplicatedStorage
+        :WaitForChild("Remotes", 10)
+        :WaitForChild("Replication", 10)
+        :WaitForChild("Fighter", 10)
+        :WaitForChild("UpdateCameraRotation", 10)
+end)
+
+pcall(function()
+    UtilityModule = require(
+        ReplicatedStorage
+            :WaitForChild("Modules", 10)
+            :WaitForChild("Utility", 10)
+    )
+end)
+
+--// =============================================
 --// [5] SETTINGS
 --// =============================================
 local Settings = {
@@ -95,24 +122,18 @@ local Settings = {
     TeamCheck      = false,
     VisibleCheck   = false,
 
-    -- DELAY POSITION
-    -- separate X (yaw) and Y (pitch) smoothing
-    -- allows different horizontal vs vertical speed
-    -- JumpSmoothing slows tracking on airborne targets
-    XSmooth        = 100,    -- 1-100%: horizontal aim speed
-    YSmooth        = 100,    -- 1-100%: vertical aim speed
-    JumpSmoothing  = 50,     -- 1-100%: tracking speed on jumping targets
+    XSmooth        = 100,
+    YSmooth        = 100,
+    JumpSmoothing  = 50,
 
-    -- CLOSEST PART
-    -- instead of always Head or HumanoidRootPart
-    -- picks the closest VISIBLE body part to crosshair
     ClosestPart    = false,
-
-    -- CLOSEST POSITION
-    -- instead of aiming at part center (Position)
-    -- aims at the closest POINT on the part surface
-    -- more precise, especially for headshots
     ClosestPosition = false,
+
+    --// [NEW] SILENT AIM SETTINGS
+    SilentAim        = false,
+    SilentAimHead    = true,
+    SilentShowFOV    = false,
+    SilentFOVRadius  = 200,
 }
 
 --// =============================================
@@ -123,6 +144,8 @@ local SAVE_FIELDS = {
     "TeamCheck", "VisibleCheck",
     "XSmooth", "YSmooth", "JumpSmoothing",
     "ClosestPart", "ClosestPosition",
+    --// [NEW] silent aim config fields
+    "SilentAim", "SilentAimHead", "SilentShowFOV", "SilentFOVRadius",
 }
 
 local function saveConfig(name)
@@ -170,7 +193,7 @@ local function getConfigList()
 end
 
 --// =============================================
---// [7] FOV CIRCLE
+--// [7] FOV CIRCLE (AIMBOT)
 --// =============================================
 local fovCircle = nil
 pcall(function()
@@ -182,9 +205,25 @@ pcall(function()
 end)
 
 --// =============================================
+--// [7.5] FOV CIRCLE (SILENT AIM)              [NEW]
+--// separate circle so you can see both FOVs
+--// =============================================
+local silentFovCircle = nil
+pcall(function()
+    silentFovCircle = Drawing.new("Circle")
+    silentFovCircle.Thickness    = 1.5
+    silentFovCircle.NumSides     = 64
+    silentFovCircle.Radius       = Settings.SilentFOVRadius
+    silentFovCircle.Filled       = false
+    silentFovCircle.Visible      = false
+    silentFovCircle.ZIndex       = 998
+    silentFovCircle.Transparency = 0.8
+    silentFovCircle.Color        = Color3.fromRGB(255, 100, 100)
+end)
+
+--// =============================================
 --// [8] UTILITY FUNCTIONS
 --// =============================================
-
 local function getScreenCenter()
     return Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
 end
@@ -228,9 +267,6 @@ end
 
 --// =============================================
 --// [9] CLOSEST PART SYSTEM
---// when enabled, finds the body part whose
---// screen position is closest to crosshair
---// instead of always using Head or HumanoidRootPart
 --// =============================================
 local BODY_PARTS = {
     "Head", "HumanoidRootPart",
@@ -239,7 +275,6 @@ local BODY_PARTS = {
     "LeftLowerArm", "RightLowerArm",
     "LeftUpperLeg", "RightUpperLeg",
     "LeftLowerLeg", "RightLowerLeg",
-    -- R6 fallbacks
     "Torso", "Left Arm", "Right Arm",
     "Left Leg", "Right Leg",
 }
@@ -268,35 +303,22 @@ end
 
 --// =============================================
 --// [10] CLOSEST POSITION SYSTEM
---// when enabled, finds the closest POINT on the
---// part surface to the camera look ray
---// instead of aiming at part center (Position)
---//
---// uses the part's bounding box to clamp the
---// aim point to the nearest surface point
 --// =============================================
 local function getClosestPointOnPart(part)
     if not part then return nil end
 
     local ok, result = pcall(function()
-        local camPos = Camera.CFrame.Position
-        local camLook = Camera.CFrame.LookVector
-
-        -- transform camera position into part local space
+        local camPos   = Camera.CFrame.Position
         local partCF   = part.CFrame
         local partSize = part.Size / 2
 
         local localCamPos = partCF:PointToObjectSpace(camPos)
 
-        -- clamp the local camera position to the part bounds
-        -- this gives us the nearest point on the surface
         local clampedX = math.clamp(localCamPos.X, -partSize.X, partSize.X)
         local clampedY = math.clamp(localCamPos.Y, -partSize.Y, partSize.Y)
         local clampedZ = math.clamp(localCamPos.Z, -partSize.Z, partSize.Z)
 
         local localClosest = Vector3.new(clampedX, clampedY, clampedZ)
-
-        -- convert back to world space
         return partCF:PointToWorldSpace(localClosest)
     end)
 
@@ -305,8 +327,6 @@ end
 
 --// =============================================
 --// [11] CHECK IF TARGET IS AIRBORNE
---// used for JumpSmoothing — reduces tracking
---// speed when target is in the air
 --// =============================================
 local function isAirborne(character)
     if not character then return false end
@@ -325,7 +345,7 @@ local function isAirborne(character)
 end
 
 --// =============================================
---// [12] FIND TARGET
+--// [12] FIND TARGET (AIMBOT)
 --// =============================================
 local function getTarget()
     local center   = getScreenCenter()
@@ -342,14 +362,11 @@ local function getTarget()
         local hum = char:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then continue end
 
-        -- select which part to use
         local part
 
         if Settings.ClosestPart then
-            -- find body part closest to crosshair
             part = getClosestPart(char)
         else
-            -- default: Head or HumanoidRootPart
             local partName = Settings.AimHead and "Head" or "HumanoidRootPart"
             part = char:FindFirstChild(partName)
         end
@@ -371,23 +388,129 @@ local function getTarget()
 end
 
 --// =============================================
+--// [12.5] SILENT AIM SYSTEM                   [NEW]
+--//
+--// intercepts the UpdateCameraRotation remote
+--// and replaces the encoded camera rotation
+--// with one pointing at the nearest enemy
+--//
+--// the server uses camera rotation to calculate
+--// bullet direction, so this makes bullets hit
+--// while your local camera stays normal
+--// =============================================
+
+local silentHookApplied = false
+local silentOldNamecall = nil
+
+-- find nearest enemy for silent aim (separate from aimbot)
+local function getSilentTarget()
+    local center   = getScreenCenter()
+    local bestPart = nil
+    local bestDist = Settings.SilentFOVRadius
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        if Settings.TeamCheck and isSameTeam(player) then continue end
+
+        local char = player.Character
+        if not char then continue end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+
+        local partName = Settings.SilentAimHead and "Head" or "HumanoidRootPart"
+        local part = char:FindFirstChild(partName)
+        if not part then continue end
+
+        if Settings.VisibleCheck and not isVisible(part) then continue end
+
+        local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
+        if not onScreen then continue end
+
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+        if dist < bestDist then
+            bestDist = dist
+            bestPart = part
+        end
+    end
+
+    return bestPart
+end
+
+-- apply the namecall hook (runs once, checks Settings.SilentAim inside)
+local function applySilentHook()
+    if silentHookApplied then return true end
+    if not UpdateCameraRotation then return false end
+    if not UtilityModule then return false end
+
+    local success = false
+
+    pcall(function()
+        -- check executor supports required functions
+        if not getrawmetatable then return end
+        if not newcclosure     then return end
+        if not getnamecallmethod then return end
+
+        local mt = getrawmetatable(game)
+
+        -- some executors use setreadonly, others use make_writeable
+        local setRO = setreadonly or make_writeable or function() end
+
+        silentOldNamecall = mt.__namecall
+
+        setRO(mt, false)
+
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+
+            -- only intercept the exact rotation remote
+            if method == "FireServer" and self == UpdateCameraRotation then
+                if Settings.SilentAim then
+                    local target = getSilentTarget()
+                    if target then
+                        local args   = {...}
+                        local camPos = Camera.CFrame.Position
+                        local dir    = (target.Position - camPos).Unit
+
+                        -- calculate angles matching Rivals encoding convention
+                        local pitch = math.asin(-dir.Y)
+                        local yaw   = math.atan2(-dir.X, -dir.Z)
+                        local angle = Vector2.new(pitch, yaw)
+
+                        -- encode using same Utility the game uses
+                        local encodeOk, encoded = pcall(function()
+                            return UtilityModule:EncodeCameraRotation(angle)
+                        end)
+
+                        if encodeOk and encoded then
+                            args[1] = encoded
+                            return silentOldNamecall(self, unpack(args))
+                        end
+                    end
+                end
+            end
+
+            return silentOldNamecall(self, ...)
+        end)
+
+        setRO(mt, true)
+
+        silentHookApplied = true
+        success = true
+    end)
+
+    return success
+end
+
+--// =============================================
 --// [13] MAIN RENDER LOOP
---//
---// SMOOTHNESS: base lerp alpha (1-100 / 100)
---//
---// DELAY POSITION:
---//   XSmooth: multiplier on yaw (horizontal) lerp
---//   YSmooth: multiplier on pitch (vertical) lerp
---//   JumpSmoothing: reduces speed on airborne targets
---//
---// CLOSEST PART: picks nearest body part to crosshair
---// CLOSEST POSITION: aims at nearest surface point
 --// =============================================
 local renderConnection
 
 renderConnection = RunService.RenderStepped:Connect(function()
     Camera = workspace.CurrentCamera
 
+    -- aimbot FOV circle
     if fovCircle then
         pcall(function()
             fovCircle.Position = getScreenCenter()
@@ -396,6 +519,16 @@ renderConnection = RunService.RenderStepped:Connect(function()
         end)
     end
 
+    --// [NEW] silent aim FOV circle
+    if silentFovCircle then
+        pcall(function()
+            silentFovCircle.Position = getScreenCenter()
+            silentFovCircle.Radius   = Settings.SilentFOVRadius
+            silentFovCircle.Visible  = Settings.SilentShowFOV
+        end)
+    end
+
+    -- aimbot camera control
     if not Settings.Enabled then return end
     if not CameraController then return end
 
@@ -405,8 +538,6 @@ renderConnection = RunService.RenderStepped:Connect(function()
     pcall(function()
         local camPos = Camera.CFrame.Position
 
-        -- get aim position
-        -- either closest surface point or part center
         local aimPos
         if Settings.ClosestPosition then
             aimPos = getClosestPointOnPart(targetPart)
@@ -416,41 +547,28 @@ renderConnection = RunService.RenderStepped:Connect(function()
 
         local dirUnit = (aimPos - camPos).Unit
 
-        -- target angles
         local targetPitch = math.asin(dirUnit.Y)
         local targetYaw   = math.atan2(-dirUnit.X, -dirUnit.Z)
 
-        -- base smoothness alpha
         local baseAlpha = Settings.Smoothness / 100
 
-        -- DELAY POSITION: separate X and Y multipliers
-        -- XSmooth at 100% = full base speed horizontal
-        -- XSmooth at 50% = half speed horizontal
-        -- same for YSmooth on vertical axis
         local xFactor = Settings.XSmooth / 100
         local yFactor = Settings.YSmooth / 100
 
         local yawAlpha   = baseAlpha * xFactor
         local pitchAlpha = baseAlpha * yFactor
 
-        -- JUMP SMOOTHING: reduce speed on airborne targets
-        -- JumpSmoothing at 100% = full speed (no reduction)
-        -- JumpSmoothing at 50% = half speed on jumping targets
-        -- JumpSmoothing at 1% = almost no tracking on jumpers
         if isAirborne(targetPart.Parent) then
             local jumpFactor = Settings.JumpSmoothing / 100
             yawAlpha   = yawAlpha   * jumpFactor
             pitchAlpha = pitchAlpha * jumpFactor
         end
 
-        -- clamp
         yawAlpha   = math.clamp(yawAlpha, 0, 1)
         pitchAlpha = math.clamp(pitchAlpha, 0, 1)
 
-        -- get current rotation
         local current = CameraController.Rotation
 
-        -- lerp each axis independently
         local newPitch = current.X + (targetPitch - current.X) * pitchAlpha
         local newYaw   = current.Y + angleDiff(current.Y, targetYaw) * yawAlpha
 
@@ -485,6 +603,7 @@ local C = {
     btnRed      = Color3.fromRGB(180, 45, 45),
     warning     = Color3.fromRGB(255, 180, 50),
     info        = Color3.fromRGB(100, 180, 255),
+    silentAccent = Color3.fromRGB(255, 80, 80),     --// [NEW]
 }
 
 --// =============================================
@@ -520,7 +639,6 @@ Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 14)
 local mStroke = Instance.new("UIStroke"); mStroke.Color = C.accentDim
 mStroke.Thickness = 1.5; mStroke.Transparency = 0.3; mStroke.Parent = mainFrame
 
--- floating button
 local floatBtn = Instance.new("TextButton")
 floatBtn.Size = UDim2.new(0, 46, 0, 46); floatBtn.Position = UDim2.new(0, 14, 0.45, 0)
 floatBtn.BackgroundColor3 = C.floatBtn; floatBtn.Text = SILENT_LOAD and "⚡" or "✕"
@@ -639,6 +757,15 @@ local function createSection(text)
     c.LayoutOrder = nextOrder(); c.Parent = content
     local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 1, 0); l.Position = UDim2.new(0, 4, 0, 0)
     l.BackgroundTransparency = 1; l.Text = text; l.TextColor3 = C.section; l.TextSize = 11
+    l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.Parent = c
+end
+
+--// [NEW] createSection with custom color for silent aim
+local function createColoredSection(text, color)
+    local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 26); c.BackgroundTransparency = 1
+    c.LayoutOrder = nextOrder(); c.Parent = content
+    local l = Instance.new("TextLabel"); l.Size = UDim2.new(1, 0, 1, 0); l.Position = UDim2.new(0, 4, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = text; l.TextColor3 = color or C.section; l.TextSize = 11
     l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.Parent = c
 end
 
@@ -791,6 +918,18 @@ end
 
 if CameraController then createStatus("✓ CameraController connected", C.success)
 else createStatus("✗ CameraController not found", C.warning) end
+
+--// [NEW] silent aim module status
+if UpdateCameraRotation and UtilityModule then
+    createStatus("✓ Remote & Utility found", C.success)
+elseif UpdateCameraRotation then
+    createStatus("⚠ Remote found, Utility missing", C.warning)
+elseif UtilityModule then
+    createStatus("⚠ Utility found, Remote missing", C.warning)
+else
+    createStatus("✗ Remote & Utility not found", C.danger)
+end
+
 if SILENT_LOAD then createStatus("🔇 Silent Load", C.textDim) end
 if AUTO_LOAD then createStatus("⚡ Auto Load ON", C.accentGlow) end
 
@@ -822,6 +961,58 @@ createSection("ADVANCED TARGETING")
 createToggle("Closest Part", "ClosestPart", false, function(v) Settings.ClosestPart = v end)
 createToggle("Closest Position", "ClosestPosition", false, function(v) Settings.ClosestPosition = v end)
 
+--// =============================================
+--// [21.5] SILENT AIM UI                       [NEW]
+--// =============================================
+createDivider()
+createColoredSection("SILENT AIM", C.silentAccent)
+
+--// [NEW] hook status label (updates when toggled)
+local silentHookStatusLabel = createStatus("⏳ Hook: waiting for toggle", C.textDim)
+
+createToggle("Silent Aim", "SilentAim", false, function(v)
+    Settings.SilentAim = v
+    if v then
+        local ok = applySilentHook()
+        if silentHookApplied then
+            silentHookStatusLabel.Text = "✓ Hook: active"
+            silentHookStatusLabel.TextColor3 = C.success
+        elseif not UpdateCameraRotation then
+            silentHookStatusLabel.Text = "✗ Hook: remote not found"
+            silentHookStatusLabel.TextColor3 = C.danger
+        elseif not UtilityModule then
+            silentHookStatusLabel.Text = "✗ Hook: utility not found"
+            silentHookStatusLabel.TextColor3 = C.danger
+        else
+            silentHookStatusLabel.Text = "✗ Hook: metamethod failed"
+            silentHookStatusLabel.TextColor3 = C.danger
+        end
+    else
+        if silentHookApplied then
+            silentHookStatusLabel.Text = "✓ Hook: installed (aim off)"
+            silentHookStatusLabel.TextColor3 = C.warning
+        else
+            silentHookStatusLabel.Text = "⏳ Hook: waiting for toggle"
+            silentHookStatusLabel.TextColor3 = C.textDim
+        end
+    end
+end)
+
+createToggle("Aim At Head (Silent)", "SilentAimHead", true, function(v)
+    Settings.SilentAimHead = v
+end)
+
+createToggle("Show FOV (Silent)", "SilentShowFOV", false, function(v)
+    Settings.SilentShowFOV = v
+end)
+
+createSlider("FOV Radius (Silent)", "SilentFOVRadius", 10, 500, 200, 1, function(v)
+    Settings.SilentFOVRadius = v
+end)
+
+--// =============================================
+--// CONFIG SECTION (unchanged)
+--// =============================================
 createDivider()
 createSection("CONFIG")
 
@@ -886,6 +1077,29 @@ end)
 local function fullCleanup()
     pcall(function() renderConnection:Disconnect() end)
     pcall(function() if fovCircle then fovCircle.Visible = false; fovCircle:Remove(); fovCircle = nil end end)
+
+    --// [NEW] cleanup silent aim FOV circle
+    pcall(function()
+        if silentFovCircle then
+            silentFovCircle.Visible = false
+            silentFovCircle:Remove()
+            silentFovCircle = nil
+        end
+    end)
+
+    --// [NEW] restore original namecall if hook was applied
+    pcall(function()
+        if silentHookApplied and silentOldNamecall then
+            local mt = getrawmetatable(game)
+            local setRO = setreadonly or make_writeable or function() end
+            setRO(mt, false)
+            mt.__namecall = silentOldNamecall
+            setRO(mt, true)
+            silentHookApplied = false
+            silentOldNamecall = nil
+        end
+    end)
+
     pcall(function() screenGui:Destroy() end)
     getgenv().RivalsAimbotCleanup = nil
 end
