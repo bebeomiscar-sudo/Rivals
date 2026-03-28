@@ -1,8 +1,8 @@
 --// =============================================
---// RIVALS MOBILE AIMBOT + SILENT AIM
+--// RIVALS MOBILE AIMBOT + SILENT AIM v2
 --// Smoothness · Delay Position (X/Y/Jump Smooth)
 --// Closest Part · Closest Position
---// Silent Aim (Remote Hook)
+--// Silent Aim (Utility.Raycast Hook)
 --// Config Save/Load · Team/Visible Check
 --// Silent Load · Floating Button
 --// Pure Instance UI · Rivals CameraController
@@ -86,21 +86,11 @@ if not CameraController then
 end
 
 --// =============================================
---// [4.5] SILENT AIM REMOTE & UTILITY          [NEW]
---// get the exact remote Rivals uses to send
---// camera rotation to the server, and the
---// Utility module that encodes the rotation
+--// [4.5] UTILITY MODULE (SILENT AIM)          [NEW]
+--// loads the Utility module that Rivals uses
+--// for raycasting — we hook Utility.Raycast
 --// =============================================
-local UpdateCameraRotation = nil
-local UtilityModule        = nil
-
-pcall(function()
-    UpdateCameraRotation = ReplicatedStorage
-        :WaitForChild("Remotes", 10)
-        :WaitForChild("Replication", 10)
-        :WaitForChild("Fighter", 10)
-        :WaitForChild("UpdateCameraRotation", 10)
-end)
+local UtilityModule = nil
 
 pcall(function()
     UtilityModule = require(
@@ -111,7 +101,7 @@ pcall(function()
 end)
 
 --// =============================================
---// [5] SETTINGS
+--// [5] SETTINGS                               [MODIFIED]
 --// =============================================
 local Settings = {
     Enabled        = AUTO_LOAD,
@@ -130,14 +120,22 @@ local Settings = {
     ClosestPosition = false,
 
     --// [NEW] SILENT AIM SETTINGS
-    SilentAim        = false,
-    SilentAimHead    = true,
-    SilentShowFOV    = false,
-    SilentFOVRadius  = 200,
+    SilentEnabled           = false,
+    SilentImproveAccuracy   = false,   -- enables velocity prediction
+    SilentAccuracyFactor    = 0.15,    -- velocity multiplier 0–0.5
+    SilentAntiKatana        = false,   -- skip melee-range targets
+    SilentRandomizeAimpoint = false,   -- add random offset to aim
+    SilentVisibleCheck      = false,   -- raycast wall check
+    SilentAutoShoot         = false,   -- auto click when target found
+    SilentHitchance         = 100,     -- % chance to replace aim
+    SilentFOV               = 200,     -- screen-distance filter px
+    SilentDynamicFOV        = false,   -- shrinks FOV when ADS
+    SilentIgnoreFOV         = false,   -- infinite FOV
+    SilentShowFOV           = false,   -- draw FOV circle
 }
 
 --// =============================================
---// [6] CONFIG SYSTEM
+--// [6] CONFIG SYSTEM                          [MODIFIED]
 --// =============================================
 local SAVE_FIELDS = {
     "AimHead", "ShowFOV", "FOVRadius", "Smoothness",
@@ -145,7 +143,10 @@ local SAVE_FIELDS = {
     "XSmooth", "YSmooth", "JumpSmoothing",
     "ClosestPart", "ClosestPosition",
     --// [NEW] silent aim config fields
-    "SilentAim", "SilentAimHead", "SilentShowFOV", "SilentFOVRadius",
+    "SilentEnabled", "SilentImproveAccuracy", "SilentAccuracyFactor",
+    "SilentAntiKatana", "SilentRandomizeAimpoint", "SilentVisibleCheck",
+    "SilentAutoShoot", "SilentHitchance", "SilentFOV",
+    "SilentDynamicFOV", "SilentIgnoreFOV", "SilentShowFOV",
 }
 
 local function saveConfig(name)
@@ -206,24 +207,26 @@ end)
 
 --// =============================================
 --// [7.5] FOV CIRCLE (SILENT AIM)              [NEW]
---// separate circle so you can see both FOVs
+--// blue circle — separate from aimbot FOV
+--// supports dynamic FOV scaling
 --// =============================================
 local silentFovCircle = nil
 pcall(function()
     silentFovCircle = Drawing.new("Circle")
     silentFovCircle.Thickness    = 1.5
     silentFovCircle.NumSides     = 64
-    silentFovCircle.Radius       = Settings.SilentFOVRadius
+    silentFovCircle.Radius       = Settings.SilentFOV
     silentFovCircle.Filled       = false
     silentFovCircle.Visible      = false
     silentFovCircle.ZIndex       = 998
     silentFovCircle.Transparency = 0.8
-    silentFovCircle.Color        = Color3.fromRGB(255, 100, 100)
+    silentFovCircle.Color        = Color3.fromRGB(80, 150, 255)
 end)
 
 --// =============================================
 --// [8] UTILITY FUNCTIONS
 --// =============================================
+
 local function getScreenCenter()
     return Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
 end
@@ -390,120 +393,197 @@ end
 --// =============================================
 --// [12.5] SILENT AIM SYSTEM                   [NEW]
 --//
---// intercepts the UpdateCameraRotation remote
---// and replaces the encoded camera rotation
---// with one pointing at the nearest enemy
+--// hooks Utility.Raycast — Rivals calls this
+--// with args[4]==999 for bullet raycasts
+--// we replace args[3] (aim position) with the
+--// predicted enemy head position
 --//
---// the server uses camera rotation to calculate
---// bullet direction, so this makes bullets hit
---// while your local camera stays normal
+--// the server trusts this raycast result so
+--// bullets land on the enemy while your camera
+--// stays completely untouched
 --// =============================================
 
-local silentHookApplied = false
-local silentOldNamecall = nil
+local silentHookApplied     = false
+local silentOriginalRaycast = nil
+local lastAutoShootTime     = 0
+local AUTO_SHOOT_COOLDOWN   = 0.1
 
--- find nearest enemy for silent aim (separate from aimbot)
-local function getSilentTarget()
-    local center   = getScreenCenter()
-    local bestPart = nil
-    local bestDist = Settings.SilentFOVRadius
+--// get all valid target characters (Rivals-specific)
+--// checks workspace children for Humanoids and
+--// also checks the HurtEffect folder for damaged chars
+local function silentGetTargets()
+    local targets = {}
+    for _, v in ipairs(workspace:GetChildren()) do
+        if v:FindFirstChildOfClass("Humanoid") then
+            table.insert(targets, v)
+        elseif v.Name == "HurtEffect" then
+            for _, p in ipairs(v:GetChildren()) do
+                if p.ClassName ~= "Highlight" then
+                    table.insert(targets, p)
+                end
+            end
+        end
+    end
+    return targets
+end
 
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player == LocalPlayer then continue end
-        if Settings.TeamCheck and isSameTeam(player) then continue end
+--// get predicted aim position for a character
+--// mirrors original thingidk() but adds:
+--//   • velocity prediction (Improve Accuracy)
+--//   • random offset (Randomize Aimpoint)
+local function silentGetAimPos(character)
+    local h    = character:FindFirstChild("Head")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not h then return nil end
 
-        local char = player.Character
-        if not char then continue end
+    -- velocity prediction multiplier
+    -- original code: root.Velocity * 0 (no prediction)
+    -- Improve Accuracy ON: root.Velocity * AccuracyFactor
+    local velMult = 0
+    if Settings.SilentImproveAccuracy then
+        velMult = Settings.SilentAccuracyFactor
+    end
 
-        local hum = char:FindFirstChildOfClass("Humanoid")
+    local pos
+    if h and root then
+        pos = h.Position + (root.Velocity * velMult)
+    elseif h then
+        pos = h.Position
+    else
+        return nil
+    end
+
+    -- randomize aimpoint: slight random offset per call
+    -- makes aim look more natural / less robotic
+    if Settings.SilentRandomizeAimpoint then
+        pos = pos + Vector3.new(
+            (math.random() - 0.5) * 0.7,
+            (math.random() - 0.5) * 0.4,
+            (math.random() - 0.5) * 0.7
+        )
+    end
+
+    return pos
+end
+
+--// get effective FOV radius accounting for
+--// Ignore FOV and Dynamic FOV settings
+local function silentGetEffectiveFOV()
+    if Settings.SilentIgnoreFOV then
+        return math.huge
+    end
+    local fov = Settings.SilentFOV
+    if Settings.SilentDynamicFOV then
+        -- shrink FOV proportionally when ADS (camera FieldOfView decreases)
+        fov = fov * (Camera.FieldOfView / 70)
+    end
+    return fov
+end
+
+--// find the closest valid target within FOV
+--// applies: team check, anti-katana, visible check, FOV filter
+local function silentFindTarget()
+    local cam      = workspace.CurrentCamera
+    local center   = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+    local localChar = LocalPlayer.Character
+    if not localChar then return nil end
+
+    local fovLimit   = silentGetEffectiveFOV()
+    local bestTarget = nil
+    local bestDist   = math.huge
+
+    for _, character in ipairs(silentGetTargets()) do
+        if character == localChar then continue end
+
+        local hum = character:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then continue end
 
-        local partName = Settings.SilentAimHead and "Head" or "HumanoidRootPart"
-        local part = char:FindFirstChild(partName)
-        if not part then continue end
+        -- team check (reuse aimbot setting)
+        local targetPlayer = Players:GetPlayerFromCharacter(character)
+        if targetPlayer and Settings.TeamCheck and isSameTeam(targetPlayer) then continue end
 
-        if Settings.VisibleCheck and not isVisible(part) then continue end
+        local root = character:FindFirstChild("HumanoidRootPart")
+        if not root then continue end
 
-        local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
+        -- anti-katana: skip targets within melee range (15 studs)
+        -- prevents wasting bullets on katana deflectors
+        if Settings.SilentAntiKatana then
+            local localRoot = localChar:FindFirstChild("HumanoidRootPart")
+            if localRoot then
+                local d = (root.Position - localRoot.Position).Magnitude
+                if d < 15 then continue end
+            end
+        end
+
+        -- visible check: raycast wall check
+        if Settings.SilentVisibleCheck then
+            local head = character:FindFirstChild("Head")
+            if head and not isVisible(head) then continue end
+        end
+
+        local aimPos = silentGetAimPos(character)
+        if not aimPos then continue end
+
+        local screenPos, onScreen = cam:WorldToViewportPoint(aimPos)
         if not onScreen then continue end
 
-        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-        if dist < bestDist then
-            bestDist = dist
-            bestPart = part
+        -- FOV distance filter
+        local dist = (center - Vector2.new(screenPos.X, screenPos.Y)).Magnitude
+        if dist < fovLimit and dist < bestDist then
+            bestTarget  = character
+            bestDist    = dist
         end
     end
 
-    return bestPart
+    return bestTarget
 end
 
--- apply the namecall hook (runs once, checks Settings.SilentAim inside)
+--// auto-shoot: simulate mouse click
+local function silentAutoShoot()
+    pcall(function() mouse1click() end)
+end
+
+--// apply the Utility.Raycast hook
+--// runs once — the hook internally checks Settings.SilentEnabled
+--// so toggling ON/OFF is instant without re-hooking
 local function applySilentHook()
     if silentHookApplied then return true end
-    if not UpdateCameraRotation then return false end
     if not UtilityModule then return false end
+    if not UtilityModule.Raycast then return false end
 
-    local success = false
+    local ok = pcall(function()
+        silentOriginalRaycast = UtilityModule.Raycast
 
-    pcall(function()
-        -- check executor supports required functions
-        if not getrawmetatable then return end
-        if not newcclosure     then return end
-        if not getnamecallmethod then return end
+        UtilityModule.Raycast = function(...)
+            local args = {...}
 
-        local mt = getrawmetatable(game)
-
-        -- some executors use setreadonly, others use make_writeable
-        local setRO = setreadonly or make_writeable or function() end
-
-        silentOldNamecall = mt.__namecall
-
-        setRO(mt, false)
-
-        mt.__namecall = newcclosure(function(self, ...)
-            local method = getnamecallmethod()
-
-            -- only intercept the exact rotation remote
-            if method == "FireServer" and self == UpdateCameraRotation then
-                if Settings.SilentAim then
-                    local target = getSilentTarget()
+            -- only intercept bullet raycasts (args[4] == 999)
+            if args[4] == 999 and Settings.SilentEnabled then
+                -- hitchance: random % check
+                if math.random(1, 100) <= Settings.SilentHitchance then
+                    local target = silentFindTarget()
                     if target then
-                        local args   = {...}
-                        local camPos = Camera.CFrame.Position
-                        local dir    = (target.Position - camPos).Unit
-
-                        -- calculate angles matching Rivals encoding convention
-                        local pitch = math.asin(-dir.Y)
-                        local yaw   = math.atan2(-dir.X, -dir.Z)
-                        local angle = Vector2.new(pitch, yaw)
-
-                        -- encode using same Utility the game uses
-                        local encodeOk, encoded = pcall(function()
-                            return UtilityModule:EncodeCameraRotation(angle)
-                        end)
-
-                        if encodeOk and encoded then
-                            args[1] = encoded
-                            return silentOldNamecall(self, unpack(args))
+                        local pos = silentGetAimPos(target)
+                        if pos then
+                            args[3] = pos
                         end
                     end
                 end
             end
 
-            return silentOldNamecall(self, ...)
-        end)
-
-        setRO(mt, true)
-
-        silentHookApplied = true
-        success = true
+            return silentOriginalRaycast(unpack(args))
+        end
     end)
 
-    return success
+    if ok then silentHookApplied = true end
+    return ok
 end
 
+-- apply hook immediately — safe because it checks SilentEnabled inside
+applySilentHook()
+
 --// =============================================
---// [13] MAIN RENDER LOOP
+--// [13] MAIN RENDER LOOP                      [MODIFIED]
 --// =============================================
 local renderConnection
 
@@ -519,16 +599,28 @@ renderConnection = RunService.RenderStepped:Connect(function()
         end)
     end
 
-    --// [NEW] silent aim FOV circle
+    --// [NEW] silent aim FOV circle with dynamic scaling
     if silentFovCircle then
         pcall(function()
             silentFovCircle.Position = getScreenCenter()
-            silentFovCircle.Radius   = Settings.SilentFOVRadius
-            silentFovCircle.Visible  = Settings.SilentShowFOV
+            silentFovCircle.Radius   = silentGetEffectiveFOV()
+            silentFovCircle.Visible  = Settings.SilentShowFOV and Settings.SilentEnabled
         end)
     end
 
-    -- aimbot camera control
+    --// [NEW] auto shoot: click when valid target exists
+    if Settings.SilentEnabled and Settings.SilentAutoShoot then
+        local now = tick()
+        if now - lastAutoShootTime >= AUTO_SHOOT_COOLDOWN then
+            local target = silentFindTarget()
+            if target then
+                lastAutoShootTime = now
+                silentAutoShoot()
+            end
+        end
+    end
+
+    -- aimbot camera control (unchanged)
     if not Settings.Enabled then return end
     if not CameraController then return end
 
@@ -577,7 +669,7 @@ renderConnection = RunService.RenderStepped:Connect(function()
 end)
 
 --// =============================================
---// [14] UI COLORS
+--// [14] UI COLORS                             [MODIFIED]
 --// =============================================
 local C = {
     bg          = Color3.fromRGB(14, 14, 24),
@@ -603,7 +695,11 @@ local C = {
     btnRed      = Color3.fromRGB(180, 45, 45),
     warning     = Color3.fromRGB(255, 180, 50),
     info        = Color3.fromRGB(100, 180, 255),
-    silentAccent = Color3.fromRGB(255, 80, 80),     --// [NEW]
+    --// [NEW] blue accent for silent aim section
+    silentAccent    = Color3.fromRGB(60, 130, 255),
+    silentAccentDim = Color3.fromRGB(30, 80, 180),
+    silentAccentGlow= Color3.fromRGB(100, 170, 255),
+    silentToggleOn  = Color3.fromRGB(50, 120, 240),
 }
 
 --// =============================================
@@ -744,7 +840,7 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 --// =============================================
---// [20] UI BUILDERS
+--// [20] UI BUILDERS                           [MODIFIED]
 --// =============================================
 local layoutOrder = 0
 local function nextOrder() layoutOrder = layoutOrder + 1; return layoutOrder end
@@ -760,7 +856,7 @@ local function createSection(text)
     l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.Parent = c
 end
 
---// [NEW] createSection with custom color for silent aim
+--// [NEW] section header with custom color
 local function createColoredSection(text, color)
     local c = Instance.new("Frame"); c.Size = UDim2.new(1, 0, 0, 26); c.BackgroundTransparency = 1
     c.LayoutOrder = nextOrder(); c.Parent = content
@@ -785,7 +881,9 @@ local function createStatus(text, color)
     return l
 end
 
-local function createToggle(name, settingKey, default, callback)
+local function createToggle(name, settingKey, default, callback, accentOverride)
+    local toggleAccent = accentOverride or C.accent
+
     local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 40); row.BackgroundColor3 = C.surface
     row.BorderSizePixel = 0; row.LayoutOrder = nextOrder(); row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
@@ -795,7 +893,7 @@ local function createToggle(name, settingKey, default, callback)
     lbl.Font = Enum.Font.GothamMedium; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
 
     local pill = Instance.new("Frame"); pill.Size = UDim2.new(0, 44, 0, 24); pill.Position = UDim2.new(1, -56, 0.5, -12)
-    pill.BackgroundColor3 = default and C.accent or C.toggleOff; pill.BorderSizePixel = 0; pill.Parent = row
+    pill.BackgroundColor3 = default and toggleAccent or C.toggleOff; pill.BorderSizePixel = 0; pill.Parent = row
     Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
 
     local knobF = Instance.new("Frame"); knobF.Size = UDim2.new(0, 20, 0, 20)
@@ -809,7 +907,7 @@ local function createToggle(name, settingKey, default, callback)
 
     local function setVis(v)
         knobF.Position = v and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
-        pill.BackgroundColor3 = v and C.accent or C.toggleOff
+        pill.BackgroundColor3 = v and toggleAccent or C.toggleOff
     end
 
     local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 1, 0); btn.BackgroundTransparency = 1
@@ -818,16 +916,151 @@ local function createToggle(name, settingKey, default, callback)
     btn.MouseButton1Click:Connect(function()
         state = not state
         TweenService:Create(knobF, tweenI, { Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2) }):Play()
-        TweenService:Create(pill, tweenI, { BackgroundColor3 = state and C.accent or C.toggleOff }):Play()
+        TweenService:Create(pill, tweenI, { BackgroundColor3 = state and toggleAccent or C.toggleOff }):Play()
         if callback then callback(state) end
     end)
 
     if settingKey then
-        allToggles[settingKey] = { setState = function(v) state = v; setVis(v) end, getState = function() return state end }
+        allToggles[settingKey] = {
+            setState = function(v) state = v; setVis(v) end,
+            getState = function() return state end,
+            label    = lbl,
+        }
+    end
+
+    return lbl
+end
+
+--// [NEW] toggle with inline status badge (e.g. "Always" / "None")
+local function createToggleWithBadge(name, settingKey, default, badgeOff, badgeOn, callback, accentOverride)
+    local toggleAccent = accentOverride or C.accent
+
+    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 40); row.BackgroundColor3 = C.surface
+    row.BorderSizePixel = 0; row.LayoutOrder = nextOrder(); row.Parent = content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(0.5, -6, 1, 0); lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = name; lbl.TextColor3 = C.text; lbl.TextSize = 13
+    lbl.Font = Enum.Font.GothamMedium; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
+
+    -- badge label
+    local badge = Instance.new("TextLabel"); badge.Size = UDim2.new(0, 50, 0, 18)
+    badge.Position = UDim2.new(1, -110, 0.5, -9)
+    badge.BackgroundColor3 = default and toggleAccent or C.surfaceHi; badge.BorderSizePixel = 0
+    badge.Text = default and badgeOn or badgeOff
+    badge.TextColor3 = Color3.new(1,1,1); badge.TextSize = 10
+    badge.Font = Enum.Font.GothamBold; badge.Parent = row
+    Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 6)
+
+    local pill = Instance.new("Frame"); pill.Size = UDim2.new(0, 44, 0, 24); pill.Position = UDim2.new(1, -56, 0.5, -12)
+    pill.BackgroundColor3 = default and toggleAccent or C.toggleOff; pill.BorderSizePixel = 0; pill.Parent = row
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
+    local knobF = Instance.new("Frame"); knobF.Size = UDim2.new(0, 20, 0, 20)
+    knobF.Position = default and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+    knobF.BackgroundColor3 = C.knob; knobF.BorderSizePixel = 0; knobF.Parent = pill
+    Instance.new("UICorner", knobF).CornerRadius = UDim.new(1, 0)
+    local ks = Instance.new("UIStroke"); ks.Color = Color3.new(0,0,0); ks.Thickness = 1; ks.Transparency = 0.85; ks.Parent = knobF
+
+    local state = default
+    local tweenI = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+    local function setVis(v)
+        knobF.Position = v and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+        pill.BackgroundColor3 = v and toggleAccent or C.toggleOff
+        badge.Text = v and badgeOn or badgeOff
+        badge.BackgroundColor3 = v and toggleAccent or C.surfaceHi
+    end
+
+    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 1, 0); btn.BackgroundTransparency = 1
+    btn.Text = ""; btn.ZIndex = 2; btn.Parent = row
+
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(knobF, tweenI, { Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2) }):Play()
+        TweenService:Create(pill, tweenI, { BackgroundColor3 = state and toggleAccent or C.toggleOff }):Play()
+        TweenService:Create(badge, tweenI, { BackgroundColor3 = state and toggleAccent or C.surfaceHi }):Play()
+        badge.Text = state and badgeOn or badgeOff
+        if callback then callback(state) end
+    end)
+
+    if settingKey then
+        allToggles[settingKey] = {
+            setState = function(v) state = v; setVis(v) end,
+            getState = function() return state end,
+        }
     end
 end
 
-local function createSlider(name, settingKey, min, max, default, step, callback)
+--// [NEW] toggle with inline reset button (↩)
+local function createToggleWithReset(name, settingKey, default, callback, resetCallback, accentOverride)
+    local toggleAccent = accentOverride or C.accent
+
+    local row = Instance.new("Frame"); row.Size = UDim2.new(1, 0, 0, 40); row.BackgroundColor3 = C.surface
+    row.BorderSizePixel = 0; row.LayoutOrder = nextOrder(); row.Parent = content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1, -106, 1, 0); lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = name; lbl.TextColor3 = C.text; lbl.TextSize = 13
+    lbl.Font = Enum.Font.GothamMedium; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
+
+    -- reset button
+    local resetBtn = Instance.new("TextButton"); resetBtn.Size = UDim2.new(0, 28, 0, 24)
+    resetBtn.Position = UDim2.new(1, -92, 0.5, -12)
+    resetBtn.BackgroundColor3 = C.surfaceHi; resetBtn.Text = "↩"
+    resetBtn.TextColor3 = C.textDim; resetBtn.TextSize = 14; resetBtn.Font = Enum.Font.GothamBold
+    resetBtn.BorderSizePixel = 0; resetBtn.ZIndex = 3; resetBtn.Parent = row
+    Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 6)
+
+    local pill = Instance.new("Frame"); pill.Size = UDim2.new(0, 44, 0, 24); pill.Position = UDim2.new(1, -56, 0.5, -12)
+    pill.BackgroundColor3 = default and toggleAccent or C.toggleOff; pill.BorderSizePixel = 0; pill.Parent = row
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
+    local knobF = Instance.new("Frame"); knobF.Size = UDim2.new(0, 20, 0, 20)
+    knobF.Position = default and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+    knobF.BackgroundColor3 = C.knob; knobF.BorderSizePixel = 0; knobF.Parent = pill
+    Instance.new("UICorner", knobF).CornerRadius = UDim.new(1, 0)
+    local ks = Instance.new("UIStroke"); ks.Color = Color3.new(0,0,0); ks.Thickness = 1; ks.Transparency = 0.85; ks.Parent = knobF
+
+    local state = default
+    local tweenI = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+    local function setVis(v)
+        knobF.Position = v and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2)
+        pill.BackgroundColor3 = v and toggleAccent or C.toggleOff
+    end
+
+    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1, 0, 1, 0); btn.BackgroundTransparency = 1
+    btn.Text = ""; btn.ZIndex = 2; btn.Parent = row
+
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(knobF, tweenI, { Position = state and UDim2.new(0, 22, 0, 2) or UDim2.new(0, 2, 0, 2) }):Play()
+        TweenService:Create(pill, tweenI, { BackgroundColor3 = state and toggleAccent or C.toggleOff }):Play()
+        if callback then callback(state) end
+    end)
+
+    resetBtn.MouseButton1Click:Connect(function()
+        state = false
+        TweenService:Create(knobF, tweenI, { Position = UDim2.new(0, 2, 0, 2) }):Play()
+        TweenService:Create(pill, tweenI, { BackgroundColor3 = C.toggleOff }):Play()
+        TweenService:Create(resetBtn, TweenInfo.new(0.1), { BackgroundColor3 = C.silentAccent }):Play()
+        task.delay(0.15, function()
+            pcall(function() TweenService:Create(resetBtn, TweenInfo.new(0.1), { BackgroundColor3 = C.surfaceHi }):Play() end)
+        end)
+        if resetCallback then resetCallback() end
+    end)
+
+    if settingKey then
+        allToggles[settingKey] = {
+            setState = function(v) state = v; setVis(v) end,
+            getState = function() return state end,
+        }
+    end
+end
+
+local function createSlider(name, settingKey, min, max, default, step, callback, accentOverride)
+    local sliderAccent = accentOverride or C.accent
     step = step or 1; local decimals = 0
     local ss = tostring(step); local dot = ss:find("%%.")
     if not dot then dot = ss:find("%.") end
@@ -852,13 +1085,13 @@ local function createSlider(name, settingKey, min, max, default, step, callback)
     track.BackgroundColor3 = C.sliderTrack; track.BorderSizePixel = 0; track.Parent = row
     Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
-    local fill = Instance.new("Frame"); fill.Size = UDim2.new(initPct, 0, 1, 0); fill.BackgroundColor3 = C.accent
+    local fill = Instance.new("Frame"); fill.Size = UDim2.new(initPct, 0, 1, 0); fill.BackgroundColor3 = sliderAccent
     fill.BorderSizePixel = 0; fill.Parent = track; Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
 
     local thumb = Instance.new("Frame"); thumb.Size = UDim2.new(0, 18, 0, 18); thumb.Position = UDim2.new(initPct, -9, 0.5, -9)
     thumb.BackgroundColor3 = C.knob; thumb.BorderSizePixel = 0; thumb.ZIndex = 3; thumb.Parent = track
     Instance.new("UICorner", thumb).CornerRadius = UDim.new(1, 0)
-    local ts = Instance.new("UIStroke"); ts.Color = C.accent; ts.Thickness = 2; ts.Parent = thumb
+    local ts = Instance.new("UIStroke"); ts.Color = sliderAccent; ts.Thickness = 2; ts.Parent = thumb
 
     local data = { track=track, fill=fill, thumb=thumb, label=lbl, name=name, min=min, max=max, snap=snap, fmt=fmt, value=default, callback=callback }
 
@@ -913,21 +1146,19 @@ local function refreshUI()
 end
 
 --// =============================================
---// [21] BUILD UI
+--// [21] BUILD UI — AIMBOT SECTION (unchanged)
 --// =============================================
 
 if CameraController then createStatus("✓ CameraController connected", C.success)
 else createStatus("✗ CameraController not found", C.warning) end
 
---// [NEW] silent aim module status
-if UpdateCameraRotation and UtilityModule then
-    createStatus("✓ Remote & Utility found", C.success)
-elseif UpdateCameraRotation then
-    createStatus("⚠ Remote found, Utility missing", C.warning)
+--// [NEW] silent aim hook status
+if UtilityModule and silentHookApplied then
+    createStatus("✓ Utility.Raycast hooked", C.success)
 elseif UtilityModule then
-    createStatus("⚠ Utility found, Remote missing", C.warning)
+    createStatus("⚠ Utility found, hook pending", C.warning)
 else
-    createStatus("✗ Remote & Utility not found", C.danger)
+    createStatus("✗ Utility module not found", C.danger)
 end
 
 if SILENT_LOAD then createStatus("🔇 Silent Load", C.textDim) end
@@ -963,52 +1194,133 @@ createToggle("Closest Position", "ClosestPosition", false, function(v) Settings.
 
 --// =============================================
 --// [21.5] SILENT AIM UI                       [NEW]
+--//
+--// blue-accented section with all controls
+--// for the Utility.Raycast silent aim system
 --// =============================================
+
 createDivider()
+
+-- blue divider line for visual separation
+do
+    local blueLine = Instance.new("Frame"); blueLine.Size = UDim2.new(1, 0, 0, 3)
+    blueLine.BackgroundColor3 = C.silentAccent; blueLine.BorderSizePixel = 0
+    blueLine.LayoutOrder = nextOrder(); blueLine.Parent = content
+    Instance.new("UICorner", blueLine).CornerRadius = UDim.new(1, 0)
+end
+
 createColoredSection("SILENT AIM", C.silentAccent)
 
---// [NEW] hook status label (updates when toggled)
-local silentHookStatusLabel = createStatus("⏳ Hook: waiting for toggle", C.textDim)
+-- hook status label that updates when toggled
+local silentHookStatusLabel = createStatus(
+    silentHookApplied and "✓ Hook: active" or "⏳ Hook: waiting",
+    silentHookApplied and C.success or C.textDim
+)
 
-createToggle("Silent Aim", "SilentAim", false, function(v)
-    Settings.SilentAim = v
-    if v then
-        local ok = applySilentHook()
-        if silentHookApplied then
+-- Enable Silent toggle with Always/None badge
+createToggleWithBadge(
+    "Silent Aim", "SilentEnabled", false,
+    "None", "Always",
+    function(v)
+        Settings.SilentEnabled = v
+        if v and not silentHookApplied then
+            local ok = applySilentHook()
+            if ok then
+                silentHookStatusLabel.Text = "✓ Hook: active"
+                silentHookStatusLabel.TextColor3 = C.success
+            else
+                silentHookStatusLabel.Text = "✗ Hook: failed"
+                silentHookStatusLabel.TextColor3 = C.danger
+            end
+        elseif v and silentHookApplied then
             silentHookStatusLabel.Text = "✓ Hook: active"
             silentHookStatusLabel.TextColor3 = C.success
-        elseif not UpdateCameraRotation then
-            silentHookStatusLabel.Text = "✗ Hook: remote not found"
-            silentHookStatusLabel.TextColor3 = C.danger
-        elseif not UtilityModule then
-            silentHookStatusLabel.Text = "✗ Hook: utility not found"
-            silentHookStatusLabel.TextColor3 = C.danger
         else
-            silentHookStatusLabel.Text = "✗ Hook: metamethod failed"
-            silentHookStatusLabel.TextColor3 = C.danger
+            silentHookStatusLabel.Text = silentHookApplied and "✓ Hook: installed (aim off)" or "⏳ Hook: waiting"
+            silentHookStatusLabel.TextColor3 = silentHookApplied and C.warning or C.textDim
         end
-    else
-        if silentHookApplied then
-            silentHookStatusLabel.Text = "✓ Hook: installed (aim off)"
-            silentHookStatusLabel.TextColor3 = C.warning
-        else
-            silentHookStatusLabel.Text = "⏳ Hook: waiting for toggle"
-            silentHookStatusLabel.TextColor3 = C.textDim
+    end,
+    C.silentToggleOn
+)
+
+-- Improve Accuracy BETA
+createToggle("Improve Accuracy BETA", "SilentImproveAccuracy", false, function(v)
+    Settings.SilentImproveAccuracy = v
+    -- if enabling and factor is 0, set to default 0.15
+    if v and Settings.SilentAccuracyFactor == 0 then
+        Settings.SilentAccuracyFactor = 0.15
+        if allSliders["SilentAccuracyFactor"] then
+            allSliders["SilentAccuracyFactor"]:setValueFromCode(0.15)
         end
     end
-end)
+end, C.silentToggleOn)
 
-createToggle("Aim At Head (Silent)", "SilentAimHead", true, function(v)
-    Settings.SilentAimHead = v
-end)
+-- Accuracy Factor slider
+createSlider("Accuracy Factor", "SilentAccuracyFactor", 0, 0.5, 0.15, 0.005, function(v)
+    Settings.SilentAccuracyFactor = v
+end, C.silentAccent)
 
-createToggle("Show FOV (Silent)", "SilentShowFOV", false, function(v)
+-- Anti Katana
+createToggle("Anti Katana", "SilentAntiKatana", false, function(v)
+    Settings.SilentAntiKatana = v
+end, C.silentToggleOn)
+
+-- Randomize Aimpoint with ↩ reset button
+createToggleWithReset(
+    "Randomize Aimpoint", "SilentRandomizeAimpoint", false,
+    function(v) Settings.SilentRandomizeAimpoint = v end,
+    function()
+        -- reset callback: turn off randomize
+        Settings.SilentRandomizeAimpoint = false
+        if allToggles["SilentRandomizeAimpoint"] then
+            allToggles["SilentRandomizeAimpoint"].setState(false)
+        end
+    end,
+    C.silentToggleOn
+)
+
+-- Visible Check (for silent aim)
+createToggle("Visible Check", "SilentVisibleCheck", false, function(v)
+    Settings.SilentVisibleCheck = v
+end, C.silentToggleOn)
+
+-- Auto Shoot
+createToggle("Auto Shoot", "SilentAutoShoot", false, function(v)
+    Settings.SilentAutoShoot = v
+end, C.silentToggleOn)
+
+-- Hitchance slider
+createSlider("Hitchance %", "SilentHitchance", 0, 100, 100, 1, function(v)
+    Settings.SilentHitchance = v
+end, C.silentAccent)
+
+-- Field of View slider
+createSlider("Field Of View px", "SilentFOV", 0, 600, 200, 1, function(v)
+    Settings.SilentFOV = v
+end, C.silentAccent)
+
+-- Dynamic FOV
+createToggle("Dynamic FOV", "SilentDynamicFOV", false, function(v)
+    Settings.SilentDynamicFOV = v
+end, C.silentToggleOn)
+
+-- Ignore FOV
+createToggle("Ignore FOV", "SilentIgnoreFOV", false, function(v)
+    Settings.SilentIgnoreFOV = v
+end, C.silentToggleOn)
+
+-- Show FOV Circle
+createToggle("Show FOV Circle", "SilentShowFOV", false, function(v)
     Settings.SilentShowFOV = v
-end)
+end, C.silentToggleOn)
 
-createSlider("FOV Radius (Silent)", "SilentFOVRadius", 10, 500, 200, 1, function(v)
-    Settings.SilentFOVRadius = v
-end)
+-- bottom blue line
+do
+    local blueLine2 = Instance.new("Frame"); blueLine2.Size = UDim2.new(1, 0, 0, 3)
+    blueLine2.BackgroundColor3 = C.silentAccent; blueLine2.BorderSizePixel = 0
+    blueLine2.LayoutOrder = nextOrder(); blueLine2.Parent = content
+    Instance.new("UICorner", blueLine2).CornerRadius = UDim.new(1, 0)
+end
 
 --// =============================================
 --// CONFIG SECTION (unchanged)
@@ -1072,7 +1384,7 @@ delB.MouseButton1Click:Connect(function()
 end)
 
 --// =============================================
---// [22] CLEANUP
+--// [22] CLEANUP                               [MODIFIED]
 --// =============================================
 local function fullCleanup()
     pcall(function() renderConnection:Disconnect() end)
@@ -1087,16 +1399,12 @@ local function fullCleanup()
         end
     end)
 
-    --// [NEW] restore original namecall if hook was applied
+    --// [NEW] restore original Utility.Raycast
     pcall(function()
-        if silentHookApplied and silentOldNamecall then
-            local mt = getrawmetatable(game)
-            local setRO = setreadonly or make_writeable or function() end
-            setRO(mt, false)
-            mt.__namecall = silentOldNamecall
-            setRO(mt, true)
-            silentHookApplied = false
-            silentOldNamecall = nil
+        if silentHookApplied and silentOriginalRaycast and UtilityModule then
+            UtilityModule.Raycast = silentOriginalRaycast
+            silentHookApplied     = false
+            silentOriginalRaycast = nil
         end
     end)
 
